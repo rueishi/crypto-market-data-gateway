@@ -1,0 +1,10 @@
+# ServiceLoader provider-configuration file for ConnectorFactory implementations.
+#
+# Java ServiceLoader reads this resource at runtime when VenueRegistry discovers
+# connector factories. Each non-comment, non-blank line is a fully qualified
+# implementation class name packaged in the main application artifact.
+#
+# Maven copies this file into target/classes/META-INF/services during the
+# resources phase. VenueRegistry then resolves the provider for the configured
+# VenueEnum without importing concrete venue classes from core code.
+io.rueishi.marketdata.crypto.venue.coinbase.l2.CoinbaseL2ConnectorFactory

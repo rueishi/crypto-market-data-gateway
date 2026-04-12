@@ -1,0 +1,6 @@
+# Test ServiceLoader provider-configuration file for ConnectorFactory.
+#
+# This file intentionally contains no test-only providers in Phase 2 because the
+# main artifact now registers the production Coinbase L2 factory. Keeping the
+# test resource provider-free avoids creating duplicate COINBASE_L2 factories
+# when ServiceLoader merges target/classes and target/test-classes resources.
