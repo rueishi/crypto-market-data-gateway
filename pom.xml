@@ -1,0 +1,176 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+    Maven build configuration for the crypto market data gateway.
+
+    This file is the build and dependency entry point for the Java source tree.
+    Maven reads it to compile source, compile tests, run Surefire unit tests, and
+    prepare later Failsafe integration-test execution. Phase 1 uses it to define
+    a deterministic Java 21 project skeleton and the low-latency dependencies
+    that later task cards build on.
+-->
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>io.rueishi.marketdata</groupId>
+    <artifactId>crypto-market-data-gateway</artifactId>
+    <version>0.0.1-SNAPSHOT</version>
+    <name>crypto-market-data-gateway</name>
+    <description>Low-latency crypto market data gateway.</description>
+
+    <!-- Version properties centralize dependency/plugin upgrades and keep CI builds reproducible. -->
+    <properties>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <maven.compiler.release>21</maven.compiler.release>
+
+        <agrona.version>1.20.0</agrona.version>
+        <archunit.version>1.2.1</archunit.version>
+        <assertj.version>3.24.2</assertj.version>
+        <byte-buddy-agent.version>1.14.9</byte-buddy-agent.version>
+        <hdrhistogram.version>2.1.12</hdrhistogram.version>
+        <junit-jupiter.version>5.10.0</junit-jupiter.version>
+        <log4j2.version>2.25.2</log4j2.version>
+        <lmax-disruptor.version>4.0.0</lmax-disruptor.version>
+        <maven-compiler-plugin.version>3.12.1</maven-compiler-plugin.version>
+        <maven-failsafe-plugin.version>3.2.5</maven-failsafe-plugin.version>
+        <maven-surefire-plugin.version>3.2.5</maven-surefire-plugin.version>
+        <netty.version>4.1.100.Final</netty.version>
+        <netty-tcnative.version>2.0.61.Final</netty-tcnative.version>
+        <snakeyaml.version>2.2</snakeyaml.version>
+    </properties>
+
+    <dependencies>
+        <!-- To resolve warning SLF4J: No SLF4J providers were found.
+        SLF4J: Defaulting to no-operation (NOP) logger implementation
+        most likely coming transitively from a dependency such as Netty, ArchUni-->
+        <dependency>
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-simple</artifactId>
+            <version>2.0.9</version>
+            <scope>test</scope>
+        </dependency>
+
+        <!-- Netty provides buffers, codecs, handlers, and later WebSocket/TLS transport support. -->
+        <dependency>
+            <groupId>io.netty</groupId>
+            <artifactId>netty-all</artifactId>
+            <version>${netty.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>io.netty</groupId>
+            <artifactId>netty-transport-native-epoll</artifactId>
+            <version>${netty.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>io.netty</groupId>
+            <artifactId>netty-tcnative-boringssl-static</artifactId>
+            <version>${netty-tcnative.version}</version>
+        </dependency>
+
+        <!-- Agrona supplies hot-path primitives such as AtomicCounter, direct buffers, and clocks. -->
+        <dependency>
+            <groupId>org.agrona</groupId>
+            <artifactId>agrona</artifactId>
+            <version>${agrona.version}</version>
+        </dependency>
+
+        <!-- Startup/configuration dependencies are outside the message-processing hot path. -->
+        <dependency>
+            <groupId>org.yaml</groupId>
+            <artifactId>snakeyaml</artifactId>
+            <version>${snakeyaml.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.hdrhistogram</groupId>
+            <artifactId>HdrHistogram</artifactId>
+            <version>${hdrhistogram.version}</version>
+            <optional>true</optional>
+        </dependency>
+
+        <!-- Log4j 2 async loggers use the LMAX Disruptor for high-throughput publication. -->
+        <dependency>
+            <groupId>org.apache.logging.log4j</groupId>
+            <artifactId>log4j-api</artifactId>
+            <version>${log4j2.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.logging.log4j</groupId>
+            <artifactId>log4j-core</artifactId>
+            <version>${log4j2.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>com.lmax</groupId>
+            <artifactId>disruptor</artifactId>
+            <version>${lmax-disruptor.version}</version>
+        </dependency>
+
+        <!-- Test dependencies support unit tests, structural architecture tests, and later allocation checks. -->
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <version>${junit-jupiter.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.assertj</groupId>
+            <artifactId>assertj-core</artifactId>
+            <version>${assertj.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>com.tngtech.archunit</groupId>
+            <artifactId>archunit-junit5</artifactId>
+            <version>${archunit.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>net.bytebuddy</groupId>
+            <artifactId>byte-buddy-agent</artifactId>
+            <version>${byte-buddy-agent.version}</version>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <!-- Compiles main and test sources against the Java 21 API surface. -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <version>${maven-compiler-plugin.version}</version>
+                <configuration>
+                    <release>${maven.compiler.release}</release>
+                </configuration>
+            </plugin>
+
+            <!-- Runs unit tests during `mvn test`; module-path execution is disabled because this is not a JPMS module. -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <version>${maven-surefire-plugin.version}</version>
+                <configuration>
+                    <useModulePath>false</useModulePath>
+                </configuration>
+            </plugin>
+
+            <!-- Reserves the Maven verify lifecycle for integration tests added by later phases. -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-failsafe-plugin</artifactId>
+                <version>${maven-failsafe-plugin.version}</version>
+                <configuration>
+                    <useModulePath>false</useModulePath>
+                </configuration>
+                <executions>
+                    <execution>
+                        <goals>
+                            <goal>integration-test</goal>
+                            <goal>verify</goal>
+                        </goals>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+</project>

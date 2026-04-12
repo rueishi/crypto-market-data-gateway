@@ -187,13 +187,35 @@ $env:COINBASE_EXCHANGE_API_PASSPHRASE = "<exchange-api-passphrase>"
 .\scripts\run-coinbase-l2-direct.ps1
 ```
 
-Use a different YAML file:
+Use a different YAML file on Windows:
 
 ```powershell
 .\scripts\run-coinbase-l2-direct.ps1 -ConfigPath config\coinbase-l2-direct.yaml
 ```
 
-The script validates that the three Coinbase environment variables exist, builds `target/classes` plus a dependency classpath, and launches `GatewayBootstrap`.
+On Linux/macOS, the Bash helper does the same startup path:
+
+```bash
+export COINBASE_EXCHANGE_API_KEY="<exchange-api-key>"
+export COINBASE_EXCHANGE_API_SECRET="<exchange-api-secret>"
+export COINBASE_EXCHANGE_API_PASSPHRASE="<exchange-api-passphrase>"
+
+./scripts/run-coinbase-l2-direct.sh
+```
+
+If the execute bit is not present on your checkout, run it through Bash:
+
+```bash
+bash scripts/run-coinbase-l2-direct.sh
+```
+
+Use a different YAML file on Linux/macOS:
+
+```bash
+./scripts/run-coinbase-l2-direct.sh --config config/coinbase-l2-direct.yaml
+```
+
+The scripts validate that the three Coinbase environment variables exist, build `target/classes` plus a dependency classpath, and launch `GatewayBootstrap`.
 
 ### Coinbase Credentials
 
@@ -438,6 +460,12 @@ Run Coinbase L2:
 
 ```powershell
 .\scripts\run-coinbase-l2-direct.ps1
+```
+
+Run Coinbase L2 on Linux/macOS:
+
+```bash
+./scripts/run-coinbase-l2-direct.sh
 ```
 
 Inspect generated logging-publisher messages:
