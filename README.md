@@ -1,8 +1,8 @@
 # Crypto Market Data Gateway
 
-A low-latency Java 21 platform core for normalized crypto market data. The runtime is designed around pluggable exchange venue connectors selected by configuration: each process instance runs one configured venue intentionally, with one WebSocket connection per configured instrument. The current venue implementation is Coinbase Exchange L2 over WebSocket, which parses subscribe-driven book snapshots and `l2update` deltas, then publishes compact SBE-style binary messages into a configurable downstream publisher.
+A low-latency Java 21 platform core for normalized crypto market data. The runtime is designed around pluggable exchange venue connectors selected by configuration: each process instance runs one configured venue intentionally, with one WebSocket connection per configured instrument. The current venue implementation is Coinbase Exchange L2 over WebSocket, which parses subscribe-driven book snapshots and `l2update` deltas, then publishes compact SBE-style binary messages into a configurable downstream publisher. Downstream systems can also send SBE-style recovery control messages back to the gateway to request recovery for one instrument or a batch of instruments.
 
-The project is intentionally small and explicit: Netty for transport, Agrona for counters and direct buffers, handwritten JSON scanning for venue frames, handwritten SBE-style binary encoding for downstream output, a ServiceLoader-backed venue registry, and deterministic tests around the parser, connector lifecycle, recovery, observability, and publisher contracts.
+The project is intentionally small and explicit: Netty for transport, Agrona for counters and direct buffers, handwritten JSON scanning for venue frames, handwritten SBE-style binary encoding for downstream output and recovery control input, a ServiceLoader-backed venue registry, and deterministic tests around the parser, connector lifecycle, recovery, observability, and publisher contracts.
 
 ## Philosophy
 
@@ -20,7 +20,8 @@ Implemented:
 - Coinbase WebSocket authentication with Base64-decoded API secret and HMAC-SHA256 over `timestamp + "GET" + "/users/self/verify"`.
 - Subscribe-driven snapshot gating: updates are ignored until the first valid snapshot opens the stream.
 - Handwritten SBE-style `BOOK_LEVEL` encoder for L2 price levels.
-- Recovery scaffolding for reconnect, resubscribe, reset publication, and snapshot-boundary completion.
+- Recovery scaffolding for reconnect, resubscribe, reset publication, snapshot-boundary completion, and downstream-triggered recovery requests.
+- Dedicated downstream-to-gateway SBE recovery control codecs for single-instrument `RECOVERY_REQUEST` and multi-instrument `RECOVERY_REQUEST_BATCH`.
 - Agrona-backed mapped counters and distinct error log.
 - Prometheus-format `/metrics` endpoint.
 - `IN_MEMORY` publisher for deterministic tests and local capture.
@@ -57,6 +58,15 @@ SbeEncoder -> Publisher
         |
         +--> InMemoryPublisher
         +--> LoggingPublisher -> Log4j 2 AsyncLoggerContext -> rolling file
+
+Downstream recovery control:
+  DirectBuffer RECOVERY_REQUEST / RECOVERY_REQUEST_BATCH
+        |
+        v
+  SbeRecoveryRequestReceiver
+        |
+        v
+  GatewayRuntime.requestRecovery -> RecoveryRequestRouter -> owning Connector
 
 Observability:
   GatewayCounters / InstrumentCounters -> Agrona CountersManager
@@ -116,7 +126,7 @@ src/main/java/io/rueishi/marketdata/crypto/
     observability/               Agrona counters, error log, metrics endpoint
     parser/                      Parser context and allocation-conscious scanners
     publisher/                   Publisher interface and implementations
-    recovery/                    Recovery request and strategy contracts
+    recovery/                    Recovery request routing, strategies, and SBE control receiver/codecs
     sequence/                    Sequence tracking
     snapshot/                    Snapshot gating and snapshot context
     subscription/                Subscription builder contract
@@ -342,9 +352,9 @@ sbe_base64=<base64-encoded-sbe-message>
 
 ## Wire Format
 
-Messages use a handwritten SBE-style binary layout.
+Messages use a handwritten SBE-style binary layout. Market-data messages flow from gateway to downstream through `SbeEncoder`. Recovery control messages flow in the opposite direction through `SbeRecoveryRequestEncoder`, `SbeRecoveryRequestDecoder`, and `SbeRecoveryRequestReceiver`.
 
-Header:
+Market-data header:
 
 | Field | Offset | Size | Notes |
 |---|---:|---:|---|
@@ -354,7 +364,7 @@ Header:
 | `blockLength` | 4 | 2 | fixed body length |
 | `entryCount` | 6 | 2 | repeating-group entry count |
 
-Body:
+Market-data body:
 
 | Field | Offset | Notes |
 |---|---:|---|
@@ -381,6 +391,48 @@ Repeating groups start at offset `55`.
 - quantity scale
 
 See [EncodingConstants.java](src/main/java/io/rueishi/marketdata/crypto/core/encoding/EncodingConstants.java) and [SbeEncoder.java](src/main/java/io/rueishi/marketdata/crypto/core/encoding/SbeEncoder.java) for the exact offsets and validation rules.
+
+### Recovery Control Messages
+
+Downstream-triggered recovery uses separate control-plane templates. Downstream sends these messages to the gateway; it does not send `BOOK_RESET` back to the gateway. `BOOK_RESET` remains a gateway-to-downstream market-data event that is published only after recovery is accepted.
+
+Recovery control header:
+
+| Field | Offset | Size | Notes |
+|---|---:|---:|---|
+| `magic` | 0 | 2 | `0xEB0B` |
+| `version` | 2 | 1 | current version `1` |
+| `templateId` | 3 | 1 | `RECOVERY_REQUEST=101`, `RECOVERY_REQUEST_BATCH=102` |
+| `blockLength` | 4 | 2 | fixed body length for the selected recovery template |
+| `entryCount` | 6 | 2 | `0` for single request, number of instrument ids for batch |
+
+`RECOVERY_REQUEST` body:
+
+| Field | Relative Offset | Size | Notes |
+|---|---:|---:|---|
+| `venue` | 0 | 1 | target venue byte, such as `COINBASE_L2=1` |
+| `requestType` | 1 | 1 | `RESET=1`, `RESNAPSHOT=2`, `RESYNC=3` |
+| `reasonCode` | 2 | 1 | recovery reason code |
+| `reserved` | 3 | 1 | currently `0` |
+| `instrumentId` | 4 | 4 | internal id from config |
+| `requestTimestamp` | 8 | 8 | request timestamp |
+| `diagnosticLength` | 16 | 2 | optional UTF-8 diagnostic byte length |
+| `diagnosticText` | 18 | variable | optional UTF-8 diagnostic text |
+
+`RECOVERY_REQUEST_BATCH` body:
+
+| Field | Relative Offset | Size | Notes |
+|---|---:|---:|---|
+| `venue` | 0 | 1 | target venue byte |
+| `requestType` | 1 | 1 | shared recovery action for every instrument |
+| `reasonCode` | 2 | 1 | shared recovery reason |
+| `reserved` | 3 | 1 | currently `0` |
+| `requestTimestamp` | 4 | 8 | request timestamp |
+| `diagnosticLength` | 12 | 2 | optional UTF-8 diagnostic byte length |
+| `diagnosticText` | 14 | variable | optional UTF-8 diagnostic text |
+| `instrumentIds` | after diagnostic text | `4 * entryCount` | repeating group of internal instrument ids |
+
+The decoder expands a batch into one internal `RecoveryRequest` per instrument. Malformed control messages, unsupported template ids, invalid enum values, empty batches, truncated payloads, and market-data `BOOK_RESET` messages are rejected before routing.
 
 ## Observability
 
@@ -416,7 +468,16 @@ Coinbase L2 is subscribe-driven:
 6. Track heartbeat liveness through counters.
 7. On recovery, publish a reset, reconnect/resubscribe, and wait for a fresh snapshot boundary.
 
-The recovery code is intentionally shared through core contracts so future venues can reuse the same lifecycle shape.
+Recovery can be triggered internally by parser, liveness, or publisher failure paths, or externally by a downstream control message. The downstream path is:
+
+1. A downstream adapter receives a binary `RECOVERY_REQUEST` or `RECOVERY_REQUEST_BATCH`.
+2. The adapter passes the caller-owned buffer region to `GatewayRuntime.recoveryRequestReceiver().receive(...)`.
+3. `SbeRecoveryRequestReceiver` decodes and validates the message with `SbeRecoveryRequestDecoder`.
+4. Each decoded request is delegated to `GatewayRuntime.requestRecovery(...)`.
+5. `RecoveryRequestRouter` matches by venue and instrument id and routes the request to the owning connector.
+6. If recovery is accepted, the gateway publishes `BOOK_RESET`, reconnects/resubscribes, and waits for the next valid snapshot boundary.
+
+The recovery code is intentionally shared through core contracts so future venues can reuse the same lifecycle shape. Duplicate requests while recovery is already in progress are coalesced by the connector path rather than starting duplicate reconnects or duplicate reset publications.
 
 ## Development Notes
 
