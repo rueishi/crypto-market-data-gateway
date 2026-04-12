@@ -1,0 +1,63 @@
+# Coinbase Exchange Direct Feed L2 runtime configuration.
+#
+# This file is read by GatewayBootstrap via -Dgateway.config=<path>. Coinbase
+# credentials are resolved from environment variables by ConfigLoader; do not
+# put real secrets directly in this file.
+#
+# Production Direct Feed endpoint from Coinbase Exchange Systems & Operations:
+#   wss://ws-direct.exchange.coinbase.com
+# Sandbox Direct Feed endpoint, if you want to test with sandbox credentials:
+#   wss://ws-direct.sandbox.exchange.coinbase.com
+
+instanceId: coinbase-l2-direct-local
+environment: dev
+venue: COINBASE_L2
+
+instruments:
+  # instrumentId is the internal numeric id encoded into BOOK_LEVEL messages.
+  # Add more products by adding more entries with unique instrumentId values.
+  - exchangeSymbol: BTC-USD
+    instrumentId: 1001
+
+transport:
+  connectTimeoutMs: 5000
+  reconnectBackoffBaseMs: 100
+  reconnectBackoffMaxMs: 5000
+  reconnectBackoffJitterMs: 250
+  heartbeatTimeoutMs: 30000
+  frameSizeLimitBytes: 65536
+  busyWaitEnabled: false
+  shutdownDeadlineMs: 5000
+  cpuAffinity:
+    enabled: false
+    mode: AUTO
+    eventLoopCpuIds: []
+
+encoding:
+  # Coinbase level2 snapshots can contain many levels. Keep this high enough
+  # for your expected product set while staying inside the validator maximum.
+  maxLevelsPerMessage: 10000
+  bufferHeadroomBytes: 0
+
+observability:
+  # The runtime creates these mapped files/directories if needed.
+  countersSharedMemoryPath: var/run/coinbase-l2-direct/counters
+  errorLogPath: var/run/coinbase-l2-direct/error.log
+  # Use 0 for an ephemeral local metrics port; set a fixed port for scraping.
+  metricsHttpPort: 0
+
+publisher:
+  # LOGGING uses Log4j 2 async loggers backed by the LMAX Disruptor.
+  type: LOGGING
+  logging:
+    outputPath: var/run/coinbase-l2-direct/messages.log
+    rollSizeMb: 256
+
+coinbase:
+  endpoint: wss://ws-direct.sandbox.exchange.coinbase.com
+  apiKey: ${COINBASE_EXCHANGE_API_KEY}
+  apiSecret: ${COINBASE_EXCHANGE_API_SECRET}
+  passphrase: ${COINBASE_EXCHANGE_API_PASSPHRASE}
+  channels:
+    - level2
+    - heartbeat
