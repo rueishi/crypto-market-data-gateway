@@ -42,6 +42,7 @@ Next venue and depth work:
 - Add Kraken as a new venue plugin.
 
 ## Architecture
+![architecture](https://github.com/user-attachments/assets/fbc294b1-b5a2-460b-bfc4-80c996176463)
 
 ```text
 Coinbase WebSocket
