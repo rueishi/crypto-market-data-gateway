@@ -8,3 +8,4 @@
 # resources phase. VenueRegistry then resolves the provider for the configured
 # VenueEnum without importing concrete venue classes from core code.
 io.rueishi.marketdata.crypto.venue.coinbase.l2.CoinbaseL2ConnectorFactory
+io.rueishi.marketdata.crypto.venue.coinbase.l3.CoinbaseL3ConnectorFactory

@@ -50,6 +50,7 @@ class InstrumentCountersTest {
                 "heartbeatsReceived",
                 "parseFailures",
                 "malformedRejections",
+                "authenticationErrors",
                 "unknownTypeDrops",
                 "preSnapshotDrops",
                 "unknownSymbolDrops",
@@ -98,14 +99,17 @@ class InstrumentCountersTest {
             InstrumentCounters counters = gatewayCounters.forInstrument(1001);
 
             assertThat(counters.unknownTypeDrops()).isSameAs(counters.unknownTypeDrops());
+            assertThat(counters.authenticationErrors()).isSameAs(counters.authenticationErrors());
             assertThat(counters.messagesPublished()).isSameAs(counters.messagesPublished());
             assertThat(counters.encodeBufferReuseCount()).isSameAs(counters.encodeBufferReuseCount());
 
             counters.unknownTypeDrops().increment();
+            counters.authenticationErrors().increment();
             counters.messagesPublished().getAndAdd(7);
             counters.lastHeartbeatReceivedNanos().set(123_456L);
 
             assertThat(counters.unknownTypeDrops().get()).isEqualTo(1);
+            assertThat(counters.authenticationErrors().get()).isEqualTo(1);
             assertThat(counters.messagesPublished().get()).isEqualTo(7);
             assertThat(counters.lastHeartbeatReceivedNanos().get()).isEqualTo(123_456L);
         }

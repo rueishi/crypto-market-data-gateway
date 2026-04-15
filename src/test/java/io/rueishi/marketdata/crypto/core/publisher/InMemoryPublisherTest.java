@@ -80,22 +80,17 @@ class InMemoryPublisherTest {
     }
 
     /**
-     * Verifies that publishReset captures a zero-entry BOOK_RESET without recording publisher latency.
+     * Verifies that publishReset captures a schema v2 zero-entry BOOK_RESET without recording publisher latency.
      */
     @Test
-    void publishResetEncodesZeroEntryBookResetControlMessage() {
+    void publishReset_encodesCorrect59ByteBookReset() {
         InMemoryPublisher publisher = new InMemoryPublisher(2, 64);
         InstrumentCounters counters = CoreTestFixtures.newInstrumentCounters();
 
-        publisher.publishReset(
-                1001,
-                VenueEnum.COINBASE_L2.byteValue(),
-                BookDepth.L2.byteValue(),
-                TemplateId.BOOK_LEVEL.byteValue(),
-                () -> 123_456L);
+        publishReset(publisher);
 
         ByteBuffer decoded = ByteBuffer.wrap(publisher.lastMessage()).order(EncodingConstants.BYTE_ORDER);
-        assertThat(publisher.lastMessage()).hasSize(EncodingConstants.MESSAGE_PREFIX_LENGTH);
+        assertThat(publisher.lastMessage()).hasSize(EncodingConstants.BOOK_RESET_SIZE);
         assertThat(Short.toUnsignedInt(decoded.getShort(EncodingConstants.MAGIC_OFFSET))).isEqualTo(EncodingConstants.MAGIC);
         assertThat(Byte.toUnsignedInt(decoded.get(EncodingConstants.TEMPLATE_ID_OFFSET))).isEqualTo(TemplateId.BOOK_LEVEL.byteValue());
         assertThat(Short.toUnsignedInt(decoded.getShort(EncodingConstants.ENTRY_COUNT_OFFSET))).isZero();
@@ -105,9 +100,64 @@ class InMemoryPublisherTest {
         assertThat(decoded.getLong(EncodingConstants.GATEWAY_MESSAGE_SEQ_OFFSET)).isZero();
         assertThat(decoded.getLong(EncodingConstants.SEQ1_OFFSET)).isZero();
         assertThat(decoded.getLong(EncodingConstants.SEQ2_OFFSET)).isZero();
-        assertThat(decoded.getLong(EncodingConstants.EXCHANGE_TIMESTAMP_OFFSET)).isEqualTo(-1L);
+        assertThat(decoded.getLong(EncodingConstants.EXCHANGE_TIMESTAMP_OFFSET)).isEqualTo(EncodingConstants.NO_TIMESTAMP);
         assertThat(decoded.getLong(EncodingConstants.INGRESS_TIMESTAMP_OFFSET)).isEqualTo(123_456L);
+        assertThat(decoded.getInt(EncodingConstants.CHECKSUM_OFFSET)).isEqualTo(EncodingConstants.NO_CHECKSUM);
         assertThat(counters.publisherLatencyLastNanos().get()).isZero();
+    }
+
+    /**
+     * Verifies reset messages advertise the schema v2 body block length.
+     */
+    @Test
+    void publishReset_blockLengthIs51() {
+        InMemoryPublisher publisher = new InMemoryPublisher(1, 64);
+
+        publishReset(publisher);
+
+        ByteBuffer decoded = ByteBuffer.wrap(publisher.lastMessage()).order(EncodingConstants.BYTE_ORDER);
+        assertThat(Short.toUnsignedInt(decoded.getShort(EncodingConstants.BLOCK_LENGTH_OFFSET)))
+                .isEqualTo(EncodingConstants.BODY_BLOCK_LENGTH);
+    }
+
+    /**
+     * Verifies reset messages explicitly write the schema v2 checksum placeholder at offset 55.
+     */
+    @Test
+    void publishReset_checksumFieldIsZero() {
+        InMemoryPublisher publisher = new InMemoryPublisher(1, 64);
+
+        publishReset(publisher);
+
+        ByteBuffer decoded = ByteBuffer.wrap(publisher.lastMessage()).order(EncodingConstants.BYTE_ORDER);
+        assertThat(decoded.getInt(EncodingConstants.CHECKSUM_OFFSET)).isEqualTo(EncodingConstants.NO_CHECKSUM);
+    }
+
+    /**
+     * Verifies BOOK_RESET is encoded as a zero-entry message with no repeating group.
+     */
+    @Test
+    void publishReset_entryCountIsZero() {
+        InMemoryPublisher publisher = new InMemoryPublisher(1, 64);
+
+        publishReset(publisher);
+
+        ByteBuffer decoded = ByteBuffer.wrap(publisher.lastMessage()).order(EncodingConstants.BYTE_ORDER);
+        assertThat(Short.toUnsignedInt(decoded.getShort(EncodingConstants.ENTRY_COUNT_OFFSET))).isZero();
+    }
+
+    /**
+     * Verifies reset messages carry schema version 2 in the header.
+     */
+    @Test
+    void publishReset_schemaVersionIsTwo() {
+        InMemoryPublisher publisher = new InMemoryPublisher(1, 64);
+
+        publishReset(publisher);
+
+        ByteBuffer decoded = ByteBuffer.wrap(publisher.lastMessage()).order(EncodingConstants.BYTE_ORDER);
+        assertThat(Byte.toUnsignedInt(decoded.get(EncodingConstants.VERSION_OFFSET))).isEqualTo(EncodingConstants.VERSION);
+        assertThat(EncodingConstants.VERSION).isEqualTo(2);
     }
 
     /**
@@ -157,5 +207,14 @@ class InMemoryPublisherTest {
     private static void publishOneByte(InMemoryPublisher publisher, UnsafeBuffer buffer, int value) {
         buffer.putByte(0, (byte) value);
         publisher.publish(buffer, 0, 1, null, null);
+    }
+
+    private static void publishReset(InMemoryPublisher publisher) {
+        publisher.publishReset(
+                1001,
+                VenueEnum.COINBASE_L2.byteValue(),
+                BookDepth.L2.byteValue(),
+                TemplateId.BOOK_LEVEL.byteValue(),
+                () -> 123_456L);
     }
 }

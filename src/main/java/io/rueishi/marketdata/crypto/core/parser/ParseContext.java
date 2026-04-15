@@ -61,6 +61,19 @@ public interface ParseContext {
     SbeEncoder encoder();
 
     /**
+     * Returns the connector-owned trade encoder used by L3 match-message parsing.
+     *
+     * <p>Most venues reuse {@link #encoder()} because they publish only one
+     * template. Schema v2 L3 feeds publish both {@code ORDER_EVENT} and
+     * {@code TRADE_EVENT} messages, so connectors may install a second
+     * pre-allocated encoder dedicated to trade messages while keeping the parse
+     * context itself session-scoped and allocation-free on the hot path.</p>
+     *
+     * @return stable trade encoder for this connector lifetime
+     */
+    SbeEncoder tradeEncoder();
+
+    /**
      * Returns the downstream publisher used by encoder finalization.
      *
      * @return stable publisher dependency for this connector lifetime

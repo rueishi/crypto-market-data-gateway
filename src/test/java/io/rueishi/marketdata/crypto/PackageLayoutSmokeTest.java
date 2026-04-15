@@ -69,7 +69,9 @@ class PackageLayoutSmokeTest {
                         .map(String::trim)
                         .filter(line -> !line.isEmpty())
                         .filter(line -> !line.startsWith("#")))
-                .containsExactly("io.rueishi.marketdata.crypto.venue.coinbase.l2.CoinbaseL2ConnectorFactory");
+                .containsExactlyInAnyOrder(
+                        "io.rueishi.marketdata.crypto.venue.coinbase.l2.CoinbaseL2ConnectorFactory",
+                        "io.rueishi.marketdata.crypto.venue.coinbase.l3.CoinbaseL3ConnectorFactory");
     }
 
     /**
@@ -89,6 +91,6 @@ class PackageLayoutSmokeTest {
                 "src/main/java/io/rueishi/marketdata/crypto/venue/coinbase/l2/CoinbaseL2ConnectorFactory.java"))
                 .isRegularFile();
         assertThat(PROJECT_ROOT.resolve("src/main/java/io/rueishi/marketdata/crypto/venue/coinbase/l3"))
-                .doesNotExist();
+                .isDirectory();
     }
 }

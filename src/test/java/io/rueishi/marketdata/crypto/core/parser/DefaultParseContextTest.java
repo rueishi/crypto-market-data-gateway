@@ -37,6 +37,7 @@ class DefaultParseContextTest {
         context.sequenceTracker().next();
         context.snapshotGatekeeper().accept();
         SbeEncoder encoder = context.encoder();
+        SbeEncoder tradeEncoder = context.tradeEncoder();
         Publisher publisher = context.publisher();
         InstrumentCounters counters = context.counters();
 
@@ -44,6 +45,7 @@ class DefaultParseContextTest {
 
         assertThat(context).isSameAs(sameContext);
         assertThat(context.encoder()).isSameAs(encoder);
+        assertThat(context.tradeEncoder()).isSameAs(tradeEncoder);
         assertThat(context.publisher()).isSameAs(publisher);
         assertThat(context.counters()).isSameAs(counters);
     }
@@ -145,6 +147,31 @@ class DefaultParseContextTest {
         assertThat(recoveryCount).hasValue(1);
     }
 
+    /**
+     * Verifies that callers can install a dedicated trade encoder for multi-template venue parsers.
+     */
+    @Test
+    void dedicatedTradeEncoderIsExposedSeparatelyFromPrimaryEncoder() {
+        Fixtures fixtures = new Fixtures();
+        SbeEncoder tradeEncoder = fixtures.newTradeEncoder();
+
+        DefaultParseContext context = new DefaultParseContext(
+                fixtures.encoder,
+                tradeEncoder,
+                fixtures.publisher,
+                fixtures.counters,
+                () -> 123L,
+                (type, reason, diagnosticText) -> {
+                },
+                () -> {
+                },
+                () -> {
+                });
+
+        assertThat(context.encoder()).isSameAs(fixtures.encoder);
+        assertThat(context.tradeEncoder()).isSameAs(tradeEncoder);
+    }
+
     public static final class Fixtures {
         public final InstrumentCounters counters = CoreTestFixtures.newInstrumentCounters();
         final SbeEncoder encoder = CoreTestFixtures.newEncoder();
@@ -152,6 +179,10 @@ class DefaultParseContextTest {
 
         public DefaultParseContext newParseContext() {
             return new DefaultParseContext(encoder, publisher, counters, () -> 123L);
+        }
+
+        SbeEncoder newTradeEncoder() {
+            return new SbeEncoder(1001, (byte) 1, (byte) 3, (byte) 3, 1, 0);
         }
     }
 }

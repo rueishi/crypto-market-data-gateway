@@ -35,6 +35,7 @@ public final class InstrumentCounters {
     private final AtomicCounter heartbeatsReceived;
     private final AtomicCounter parseFailures;
     private final AtomicCounter malformedRejections;
+    private final AtomicCounter authenticationErrors;
     private final AtomicCounter unknownTypeDrops;
     private final AtomicCounter preSnapshotDrops;
     private final AtomicCounter unknownSymbolDrops;
@@ -89,6 +90,7 @@ public final class InstrumentCounters {
         this.heartbeatsReceived = factory.newCounter(instrumentId, "heartbeats_received");
         this.parseFailures = factory.newCounter(instrumentId, "parse_failures");
         this.malformedRejections = factory.newCounter(instrumentId, "malformed_rejections");
+        this.authenticationErrors = factory.newCounter(instrumentId, "authentication_errors");
         this.unknownTypeDrops = factory.newCounter(instrumentId, "unknown_type_drops");
         this.preSnapshotDrops = factory.newCounter(instrumentId, "pre_snapshot_drops");
         this.unknownSymbolDrops = factory.newCounter(instrumentId, "unknown_symbol_drops");
@@ -166,6 +168,11 @@ public final class InstrumentCounters {
     /** @return malformed rejection counter for this instrument */
     public AtomicCounter malformedRejections() {
         return malformedRejections;
+    }
+
+    /** @return inbound venue authentication error counter for this instrument */
+    public AtomicCounter authenticationErrors() {
+        return authenticationErrors;
     }
 
     /** @return unknown type drop counter for this instrument */

@@ -172,6 +172,92 @@ public final class ByteBufScanner {
     }
 
     /**
+     * Parses a Coinbase UUID into high and low 64-bit halves without allocating.
+     *
+     * <p>The reader index may point at an opening quote or the first UUID byte.
+     * Parsing consumes exactly 16 bytes encoded as 32 hex digits while skipping
+     * the four RFC 4122 hyphens. When successful, {@code result[0]} receives the
+     * most significant eight bytes and {@code result[1]} receives the least
+     * significant eight bytes, matching the schema v2 order-id encoding contract
+     * used by L3 parsers and {@code ORDER_EVENT}/{@code TRADE_EVENT} messages.
+     * On malformed or truncated input the method writes {@code 0L} to both
+     * slots, leaves the reader index at the failure point, and returns
+     * {@code false} instead of throwing so hot-path callers can reject the
+     * message without extra error handling.</p>
+     *
+     * @param buf source buffer positioned at optional whitespace, an optional opening quote, or UUID text
+     * @param result caller-owned {@code long[2]} receiving high and low UUID halves
+     * @return {@code true} when a full UUID was parsed, otherwise {@code false}
+     * @throws NullPointerException if {@code buf} or {@code result} is null
+     * @throws IllegalArgumentException if {@code result} has fewer than two slots
+     */
+    public static boolean parseUuidHighLow(ByteBuf buf, long[] result) {
+        Objects.requireNonNull(buf, "buf");
+        requireUuidResult(result);
+
+        int writerIndex = buf.writerIndex();
+        int index = skipWhitespace(buf, buf.readerIndex(), writerIndex);
+        boolean quoted = index < writerIndex && buf.getByte(index) == QUOTE;
+        if (quoted) {
+            index++;
+        }
+
+        long high = 0L;
+        long low = 0L;
+        int bytesParsed = 0;
+        while (index < writerIndex) {
+            byte current = buf.getByte(index);
+            if (current == MINUS) {
+                index++;
+                continue;
+            }
+            if (quoted && current == QUOTE) {
+                break;
+            }
+
+            int highNibble = hexNibble(current);
+            if (highNibble < 0 || index + 1 >= writerIndex) {
+                return failUuidParse(buf, result, index);
+            }
+
+            int lowNibble = hexNibble(buf.getByte(index + 1));
+            if (lowNibble < 0) {
+                return failUuidParse(buf, result, index + 1);
+            }
+
+            if (bytesParsed == 16) {
+                return failUuidParse(buf, result, index);
+            }
+
+            long byteValue = ((highNibble << 4) | lowNibble) & 0xFFL;
+            if (bytesParsed < 8) {
+                high = (high << 8) | byteValue;
+            } else {
+                low = (low << 8) | byteValue;
+            }
+
+            bytesParsed++;
+            index += 2;
+            if (bytesParsed == 16) {
+                break;
+            }
+        }
+
+        if (bytesParsed != 16) {
+            return failUuidParse(buf, result, index);
+        }
+
+        if (quoted && index < writerIndex && buf.getByte(index) == QUOTE) {
+            index++;
+        }
+
+        result[0] = high;
+        result[1] = low;
+        buf.readerIndex(index);
+        return true;
+    }
+
+    /**
      * Parses a fixed-point decimal from an explicit buffer range without changing the reader index.
      *
      * <p>This overload is useful when a venue parser has already identified a
@@ -538,6 +624,19 @@ public final class ByteBufScanner {
         return value;
     }
 
+    private static int hexNibble(byte value) {
+        if (value >= '0' && value <= '9') {
+            return value - '0';
+        }
+        if (value >= 'a' && value <= 'f') {
+            return (value - 'a') + 10;
+        }
+        if (value >= 'A' && value <= 'F') {
+            return (value - 'A') + 10;
+        }
+        return -1;
+    }
+
     private static long daysSinceEpoch(int year, int month, int day) {
         int adjustedYear = year - (month <= 2 ? 1 : 0);
         long era = Math.floorDiv(adjustedYear, 400);
@@ -648,6 +747,20 @@ public final class ByteBufScanner {
         if (result.length < 2) {
             throw new IllegalArgumentException("result must have at least two slots");
         }
+    }
+
+    private static void requireUuidResult(long[] result) {
+        Objects.requireNonNull(result, "result");
+        if (result.length < 2) {
+            throw new IllegalArgumentException("result must have at least two slots");
+        }
+    }
+
+    private static boolean failUuidParse(ByteBuf buf, long[] result, int readerIndex) {
+        result[0] = 0L;
+        result[1] = 0L;
+        buf.readerIndex(readerIndex);
+        return false;
     }
 
     private static void requireRange(ByteBuf buf, int start, int end) {

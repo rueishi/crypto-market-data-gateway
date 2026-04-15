@@ -5,7 +5,6 @@ import io.rueishi.marketdata.crypto.core.encoding.EncodingConstants;
 import io.rueishi.marketdata.crypto.core.observability.InstrumentCounters;
 import java.io.IOException;
 import java.io.UncheckedIOException;
-import java.nio.ByteOrder;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Base64;
@@ -46,7 +45,7 @@ public final class LoggingPublisher implements Publisher, AutoCloseable {
     private static final String LOG_LINE_PREFIX = "sbe_base64=";
     private static int contextSequence;
 
-    private final UnsafeBuffer resetEncodingBuffer = new UnsafeBuffer(new byte[EncodingConstants.MESSAGE_PREFIX_LENGTH]);
+    private final UnsafeBuffer resetEncodingBuffer = new UnsafeBuffer(new byte[EncodingConstants.BOOK_RESET_SIZE]);
     private final LoggerContext loggerContext;
     private final Logger logger;
 
@@ -111,8 +110,9 @@ public final class LoggingPublisher implements Publisher, AutoCloseable {
      * Accepts a reset control message without updating publisher-stage latency.
      *
      * <p>The reset message has no repeating group, uses sequence fields of
-     * {@code 0}, stores {@code -1} for exchange timestamp, and uses
-     * {@code nanoClock.nanoTime()} for ingress timestamp.</p>
+     * {@code 0}, stores {@code -1} for exchange timestamp, writes the schema v2
+     * checksum placeholder as {@code 0}, and uses {@code nanoClock.nanoTime()}
+     * for ingress timestamp.</p>
      *
      * @param instrumentId stable internal instrument id for the reset
      * @param venueByte encoded venue byte
@@ -139,14 +139,18 @@ public final class LoggingPublisher implements Publisher, AutoCloseable {
         resetEncodingBuffer.putByte(EncodingConstants.EVENT_TYPE_OFFSET, EncodingConstants.EVENT_TYPE_BOOK_RESET);
         resetEncodingBuffer.putByte(EncodingConstants.VENUE_OFFSET, venueByte);
         resetEncodingBuffer.putByte(EncodingConstants.BOOK_DEPTH_OFFSET, bookDepthByte);
-        resetEncodingBuffer.putInt(EncodingConstants.INSTRUMENT_ID_OFFSET, instrumentId, ByteOrder.LITTLE_ENDIAN);
+        resetEncodingBuffer.putInt(EncodingConstants.INSTRUMENT_ID_OFFSET, instrumentId, EncodingConstants.BYTE_ORDER);
         resetEncodingBuffer.putLong(EncodingConstants.GATEWAY_MESSAGE_SEQ_OFFSET, 0L, EncodingConstants.BYTE_ORDER);
         resetEncodingBuffer.putLong(EncodingConstants.SEQ1_OFFSET, 0L, EncodingConstants.BYTE_ORDER);
         resetEncodingBuffer.putLong(EncodingConstants.SEQ2_OFFSET, 0L, EncodingConstants.BYTE_ORDER);
-        resetEncodingBuffer.putLong(EncodingConstants.EXCHANGE_TIMESTAMP_OFFSET, -1L, EncodingConstants.BYTE_ORDER);
+        resetEncodingBuffer.putLong(
+                EncodingConstants.EXCHANGE_TIMESTAMP_OFFSET,
+                EncodingConstants.NO_TIMESTAMP,
+                EncodingConstants.BYTE_ORDER);
         resetEncodingBuffer.putLong(EncodingConstants.INGRESS_TIMESTAMP_OFFSET, ingressTimestamp, EncodingConstants.BYTE_ORDER);
+        resetEncodingBuffer.putInt(EncodingConstants.CHECKSUM_OFFSET, EncodingConstants.NO_CHECKSUM, EncodingConstants.BYTE_ORDER);
 
-        logger.info(LOG_LINE_PREFIX + encodedPayload(resetEncodingBuffer, 0, EncodingConstants.MESSAGE_PREFIX_LENGTH));
+        logger.info(LOG_LINE_PREFIX + encodedPayload(resetEncodingBuffer, 0, EncodingConstants.BOOK_RESET_SIZE));
     }
 
     /**

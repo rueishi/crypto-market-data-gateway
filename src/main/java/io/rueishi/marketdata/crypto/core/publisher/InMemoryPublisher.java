@@ -2,7 +2,6 @@ package io.rueishi.marketdata.crypto.core.publisher;
 
 import io.rueishi.marketdata.crypto.core.encoding.EncodingConstants;
 import io.rueishi.marketdata.crypto.core.observability.InstrumentCounters;
-import java.nio.ByteOrder;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -25,13 +24,13 @@ import org.agrona.concurrent.UnsafeBuffer;
  * {@code BOOK_RESET} directly into the same capture ring for recovery and
  * shutdown tests, while deliberately not recording publisher-stage latency.</p>
  */
-public final class InMemoryPublisher implements Publisher {
+public class InMemoryPublisher implements Publisher {
     private static final int DEFAULT_CAPACITY = 1024;
     private static final int DEFAULT_MAX_MESSAGE_BYTES = 300_000;
 
     private final byte[][] slots;
     private final int[] lengths;
-    private final UnsafeBuffer resetEncodingBuffer = new UnsafeBuffer(new byte[EncodingConstants.MESSAGE_PREFIX_LENGTH]);
+    private final UnsafeBuffer resetEncodingBuffer = new UnsafeBuffer(new byte[EncodingConstants.BOOK_RESET_SIZE]);
     private int writeIdx;
     private int totalCount;
 
@@ -97,9 +96,10 @@ public final class InMemoryPublisher implements Publisher {
      * Encodes and captures a zero-entry {@code BOOK_RESET} control message.
      *
      * <p>The reset message has no repeating group, uses sequence fields of
-     * {@code 0}, stores {@code -1} for exchange timestamp, and uses
-     * {@code nanoClock.nanoTime()} for ingress timestamp. Publisher-stage
-     * latency counters are intentionally not updated for this control path.</p>
+     * {@code 0}, stores {@code -1} for exchange timestamp, writes the schema v2
+     * checksum placeholder as {@code 0}, and uses {@code nanoClock.nanoTime()}
+     * for ingress timestamp. Publisher-stage latency counters are intentionally
+     * not updated for this control path.</p>
      *
      * @param instrumentId stable internal instrument id
      * @param venueByte venue byte to encode
@@ -127,14 +127,18 @@ public final class InMemoryPublisher implements Publisher {
         resetEncodingBuffer.putByte(EncodingConstants.EVENT_TYPE_OFFSET, EncodingConstants.EVENT_TYPE_BOOK_RESET);
         resetEncodingBuffer.putByte(EncodingConstants.VENUE_OFFSET, venueByte);
         resetEncodingBuffer.putByte(EncodingConstants.BOOK_DEPTH_OFFSET, bookDepthByte);
-        resetEncodingBuffer.putInt(EncodingConstants.INSTRUMENT_ID_OFFSET, instrumentId, ByteOrder.LITTLE_ENDIAN);
+        resetEncodingBuffer.putInt(EncodingConstants.INSTRUMENT_ID_OFFSET, instrumentId, EncodingConstants.BYTE_ORDER);
         resetEncodingBuffer.putLong(EncodingConstants.GATEWAY_MESSAGE_SEQ_OFFSET, 0L, EncodingConstants.BYTE_ORDER);
         resetEncodingBuffer.putLong(EncodingConstants.SEQ1_OFFSET, 0L, EncodingConstants.BYTE_ORDER);
         resetEncodingBuffer.putLong(EncodingConstants.SEQ2_OFFSET, 0L, EncodingConstants.BYTE_ORDER);
-        resetEncodingBuffer.putLong(EncodingConstants.EXCHANGE_TIMESTAMP_OFFSET, -1L, EncodingConstants.BYTE_ORDER);
+        resetEncodingBuffer.putLong(
+                EncodingConstants.EXCHANGE_TIMESTAMP_OFFSET,
+                EncodingConstants.NO_TIMESTAMP,
+                EncodingConstants.BYTE_ORDER);
         resetEncodingBuffer.putLong(EncodingConstants.INGRESS_TIMESTAMP_OFFSET, ingressTimestamp, EncodingConstants.BYTE_ORDER);
+        resetEncodingBuffer.putInt(EncodingConstants.CHECKSUM_OFFSET, EncodingConstants.NO_CHECKSUM, EncodingConstants.BYTE_ORDER);
 
-        capture(resetEncodingBuffer, 0, EncodingConstants.MESSAGE_PREFIX_LENGTH);
+        capture(resetEncodingBuffer, 0, EncodingConstants.BOOK_RESET_SIZE);
     }
 
     /**

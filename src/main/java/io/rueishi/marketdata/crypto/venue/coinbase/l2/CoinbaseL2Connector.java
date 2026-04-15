@@ -328,11 +328,13 @@ public final class CoinbaseL2Connector extends AbstractConnector {
     /**
      * Runs one heartbeat timeout detection pass for the current session.
      *
-     * <p>This method is package-private so tests can drive detection with an
-     * injected clock without waiting for wall-clock scheduler delays. It
-     * increments heartbeat-missed and liveness-failure counters when the last
-     * heartbeat timestamp is older than the configured timeout, then requests
-     * autonomous reset recovery with {@link RecoveryReasonCode#HEARTBEAT_TIMEOUT}.</p>
+     * <p>This method is package-private so tests can invoke the timeout logic
+     * directly without waiting for the scheduled task. It compares the last
+     * heartbeat timestamp against {@link System#nanoTime()} so liveness still
+     * advances even when the transport-owned cached clock stops updating during
+     * inbound silence. On expiry it increments heartbeat-missed and
+     * liveness-failure counters, then requests autonomous reset recovery with
+     * {@link RecoveryReasonCode#HEARTBEAT_TIMEOUT}.</p>
      */
     void detectLivenessTimeout() {
         if (!livenessMonitoringActive) {
@@ -342,11 +344,12 @@ public final class CoinbaseL2Connector extends AbstractConnector {
         if (lastHeartbeatNanos <= 0) {
             return;
         }
-        long elapsedNanos = nanoClock().nanoTime() - lastHeartbeatNanos;
+        long nowNanos = System.nanoTime();
+        long elapsedNanos = nowNanos - lastHeartbeatNanos;
         if (elapsedNanos >= heartbeatTimeoutNanos) {
             counters().heartbeatsMissed().increment();
             counters().livenessFailures().increment();
-            counters().lastHeartbeatReceivedNanos().set(nanoClock().nanoTime());
+            counters().lastHeartbeatReceivedNanos().set(nowNanos);
             requestRecovery(
                     RecoveryRequestType.RESET,
                     RecoveryReasonCode.HEARTBEAT_TIMEOUT,

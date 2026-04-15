@@ -2669,7 +2669,7 @@ coinbase:
 - The venue-specific YAML block key must match the lowercase prefix of the configured venue:
   `COINBASE_L2` → `coinbase:`, `BINANCE_L2` → `binance:`. Missing key is a startup failure.
 - Credentials are resolved from environment variables at startup; empty resolution causes startup failure with a structured error that does not log the value
-- `encoding.maxLevelsPerMessage` must be consistent with the encode buffer capacity formula in Section 17
+- `encoding.maxLevelsPerMessage` must be consistent with the encode buffer capacity formula in Section 18
 - Configuration is parsed once at startup using **SnakeYAML**; SnakeYAML must not be imported into any hot-path class
 - `transport.cpuAffinity` is optional. If absent, treat it as `enabled=false`.
 - `transport.cpuAffinity.mode` must be `AUTO` or `EXPLICIT`; default to `AUTO` when affinity is enabled and mode is absent.
@@ -3136,12 +3136,13 @@ gradle shadowJar
   **Agrona `UnsafeBuffer` / `MutableDirectBuffer`**
 - Each connector owns **one reusable encode buffer**, allocated in `init()`
 - Buffer sized using the template-appropriate formula plus headroom:
-  - `BOOK_LEVEL`:   `alignUp(8 + 47 + (maxEntryCount × 20) + headroomBytes, granularity)`
-  - `ORDER_ENTRY`:  `alignUp(8 + 47 + (maxEntryCount × 29) + headroomBytes, granularity)`
+  - `BOOK_LEVEL`:   `alignUp(8 + 51 + (maxEntryCount × 20) + headroomBytes, granularity)`
+  - `ORDER_EVENT`:  `alignUp(8 + 51 + (maxEntryCount × 51) + headroomBytes, granularity)`
+  - `TRADE_EVENT`:  fixed 110 bytes (always 1 entry) — separate scratch buffer
 - Example for `COINBASE_L2` (BOOK_LEVEL, 10,000 entries, 8,192 headroom):
-  `8 + 47 + (10,000 × 20) + 8,192 = 208,247 bytes` → use 256 KiB
-- Example for `COINBASE_L3` (ORDER_ENTRY, 10,000 entries, 8,192 headroom):
-  `8 + 47 + (10,000 × 29) + 8,192 = 298,247 bytes` → use 512 KiB
+  `8 + 51 + (10,000 × 20) + 8,192 = 208,251 bytes` → use 256 KiB
+- Example for `COINBASE_L3` (ORDER_EVENT, 10,000 entries, 8,192 headroom):
+  `8 + 51 + (10,000 × 51) + 8,192 = 518,251 bytes` → use 1 MiB
 - Reused across **1,000,000+ messages** with zero per-message allocation
 
 ### Reuse Rules
@@ -3438,7 +3439,923 @@ recovery trigger eliminates that silent-dead-session window.
 
 ---
 
-## 15. Threading Model
+## 15. Coinbase L3 Strategy — Supported Messages
+
+This section is the complete specification for the `COINBASE_L3` venue strategy.
+It targets the authenticated Coinbase Exchange Direct Feed **`full`** channel,
+which delivers individual order lifecycle events for a level-3 order book.
+All authentication, channel subscription, message schemas, parsing rules, sequence
+mapping, snapshot acquisition, fixture contracts, acceptance criteria, and test
+coverage for `COINBASE_L3` are defined here.
+
+---
+
+### 15.1 Supported Message Set (COINBASE_L3)
+
+**Outbound:**
+- Authenticated `subscribe` for `full` and `heartbeat` (single combined message)
+- Authenticated `unsubscribe` on shutdown or recovery
+
+**Inbound — order lifecycle (hot path, encoded into `ORDER_EVENT` SBE stream):**
+- `received` — new order accepted by the exchange matching engine
+- `open` — order now resting on the order book
+- `done` — order removed from the book (filled or cancelled)
+- `activate` — stop order triggered; encoded with `reason=TRIGGERED=2`
+- `match` — trade occurred; encoded into `TRADE_EVENT` SBE stream
+- `change` — order quantity was modified
+
+**Inbound — control plane (not encoded into book output):**
+- `subscriptions` — channel acknowledgement; must validate `full` + `heartbeat`
+- `heartbeat` — connection liveness; not encoded
+- `error` — server-side rejection; triggers recovery immediately
+
+---
+
+### 15.2 Authentication Scope
+
+Authentication for `COINBASE_L3` is identical to `COINBASE_L2`:
+- WebSocket endpoint: `wss://ws-direct.exchange.coinbase.com`
+- HMAC-SHA256 signature over `timestamp + "GET" + "/users/self/verify"`
+- Required subscribe fields: `type`, `product_ids`, `channels`, `signature`,
+  `key`, `passphrase`, `timestamp`
+- Credentials must never appear in logs, metrics labels, or exception messages
+
+REST snapshot endpoint (authenticated):
+```
+GET https://api.exchange.coinbase.com/products/{product_id}/book?level=3
+Authorization: CB-ACCESS-KEY / CB-ACCESS-SIGN / CB-ACCESS-TIMESTAMP / CB-ACCESS-PASSPHRASE
+```
+The REST snapshot request uses the same HMAC-SHA256 scheme but signs
+`timestamp + "GET" + "/products/{product_id}/book?level=3"`.
+The response is a JSON object with `sequence`, `bids`, and `asks` arrays.
+Each bid/ask entry is `[price, size, order_id]`.
+
+---
+
+### 15.3 Outbound Messages
+
+**Outbound Subscribe (single message — both channels)**
+
+```json
+{
+  "type": "subscribe",
+  "product_ids": ["BTC-USD"],
+  "channels": ["full", "heartbeat"],
+  "signature": "<sig>",
+  "key": "<key>",
+  "passphrase": "<passphrase>",
+  "timestamp": "<epoch-seconds>"
+}
+```
+
+**Outbound Unsubscribe** — same structure, `"type": "unsubscribe"`
+
+---
+
+### 15.4 Inbound Control-Plane Messages
+
+**Inbound `subscriptions` Acknowledgement**
+```json
+{
+  "type": "subscriptions",
+  "channels": [
+    { "name": "full",      "product_ids": ["BTC-USD"] },
+    { "name": "heartbeat", "product_ids": ["BTC-USD"] }
+  ]
+}
+```
+Validation rules: identical to L2 (Section 14) — both `full` and `heartbeat`
+channels must be confirmed with the correct `product_id`. Missing channel or
+wrong product ID → increment `subscriptionValidationFailures`, trigger recovery.
+Extra channels tolerated.
+
+**Inbound `heartbeat`**
+```json
+{
+  "type": "heartbeat",
+  "sequence": 12345,
+  "product_id": "BTC-USD",
+  "time": "2023-02-09T20:33:10.000000Z"
+}
+```
+- Update `lastHeartbeatReceivedNanos` and increment `heartbeatsReceived` counter.
+- `sequence` captured for diagnostics only — not used for L3 book sequencing.
+- Not encoded into the SBE stream.
+- Liveness timeout algorithm is identical to Section 14.
+
+**Inbound `error`**
+```json
+{
+  "type": "error",
+  "message": "Failed to subscribe",
+  "reason": "authentication failure"
+}
+```
+Increment `authenticationErrors`, emit structured log, trigger recovery immediately.
+Handling is identical to Section 14.
+
+---
+
+### 15.5 Inbound Order Lifecycle Messages (Hot Path)
+
+All message types are parsed from `ByteBuf` using `ByteBufScanner`. Field
+order is not assumed. Extra fields are tolerated. Every message carries
+`product_id` — mismatch → `productIdMismatches` counter, no publish.
+
+**UUID parsing rule (applies to all order ID fields):**
+Parse the UUID hex string directly from the `ByteBuf` without allocating a
+`String` or `UUID` object.
+- `orderIdHigh` = bytes 0–7 of the 16-byte UUID (hex chars before the third hyphen group)
+- `orderIdLow`  = bytes 8–15 of the 16-byte UUID (hex chars from the third hyphen group)
+
+For `maker_order_id` / `taker_order_id` in `match`: apply the same rule to
+produce `makerOrderIdHigh/Low` and `takerOrderIdHigh/Low`.
+
+**Sequence mapping rule (applies to all messages including `match`):**
+
+| SBE field | Value |
+|---|---|
+| `gatewayMessageSeq` | `ctx.sequenceTracker().next()` |
+| `seq1` | `message.sequence` (Coinbase per-product event counter) |
+| `seq2` | `message.sequence` (same — each message is one event) |
+
+The exchange `sequence` field is placed in `seq1`/`seq2` so downstream
+consumers can detect exchange-level gaps. The gateway does not itself check
+for exchange sequence gaps — liveness is maintained through heartbeat timeout.
+
+---
+
+#### `received` — New Order Accepted
+
+```json
+{
+  "type": "received",
+  "time": "2023-02-09T20:33:09.123456Z",
+  "product_id": "BTC-USD",
+  "sequence": 10000001,
+  "order_id": "d50ec984-77a8-460a-b958-66f114b0de9b",
+  "size": "1.00000000",
+  "price": "333.98",
+  "side": "buy",
+  "order_type": "limit"
+}
+```
+
+Market order variant — no `price`, no `size`, has `funds` instead:
+```json
+{
+  "type": "received",
+  "sequence": 10000002,
+  "order_id": "dddec984-77a8-460a-b958-66f114b0de9b",
+  "funds": "3000.00",
+  "side": "buy",
+  "order_type": "market",
+  "product_id": "BTC-USD",
+  "time": "2023-02-09T20:33:09.200000Z"
+}
+```
+
+**Encoding rule:**
+
+| SBE field | Value |
+|---|---|
+| `eventType` | BOOK_UPDATE=3 |
+| `templateId` | ORDER_EVENT=2 |
+| `action` | UPSERT=1 |
+| `reason` | RECEIVED=0 |
+| `orderIdHigh/Low` | UUID parsed per rule above |
+| `side` | `"buy"` → BID=1, `"sell"` → ASK=2 |
+| `orderType` | `"limit"` → LIMIT=1, `"market"` → MARKET=2, `"stop"` → STOP=3 |
+| `priceMantissa/Scale` | parsed from `price`; absent (market order) → 0, 0 |
+| `qtyMantissa/Scale` | parsed from `size`; absent (market order) → 0, 0 |
+| `oldQtyMantissa/Scale` | 0, 0 |
+| `orderTimestamp` | -1 — Coinbase does not provide per-order timestamp |
+
+**Do not touch the order book.** Order is not yet resting.
+
+---
+
+#### `open` — Order Now Resting on Book
+
+```json
+{
+  "type": "open",
+  "time": "2023-02-09T20:33:09.456789Z",
+  "product_id": "BTC-USD",
+  "sequence": 10000003,
+  "order_id": "d50ec984-77a8-460a-b958-66f114b0de9b",
+  "remaining_size": "1.00000000",
+  "price": "333.98",
+  "side": "buy"
+}
+```
+
+**Encoding rule:**
+
+| SBE field | Value |
+|---|---|
+| `eventType` | BOOK_UPDATE=3 |
+| `templateId` | ORDER_EVENT=2 |
+| `action` | UPSERT=1 |
+| `reason` | OPEN=1 |
+| `orderType` | LIMIT=1 — only limit orders generate `open` |
+| `qtyMantissa/Scale` | parsed from `remaining_size` |
+| `oldQtyMantissa/Scale` | 0, 0 |
+
+`remaining_size` may be less than the `size` in `received` if the order
+partially filled on entry before resting.
+
+**Add order to book** at `price` with `remaining_size`.
+
+---
+
+#### `done` — Order Removed from Book
+
+```json
+{
+  "type": "done",
+  "time": "2023-02-09T20:33:09.789012Z",
+  "product_id": "BTC-USD",
+  "sequence": 10000004,
+  "order_id": "d50ec984-77a8-460a-b958-66f114b0de9b",
+  "reason": "filled",
+  "side": "buy",
+  "price": "333.98",
+  "remaining_size": "0.00000000"
+}
+```
+
+**Reason mapping:**
+
+| Coinbase `reason` | SBE `reason` code |
+|---|---|
+| `"filled"` | FILLED=4 |
+| `"canceled"` | CANCELLED=5 |
+| `"canceled"` + TIF expiry (`cancel_reason` 101) | EXPIRED=6 |
+
+**Encoding rule:**
+
+| SBE field | Value |
+|---|---|
+| `eventType` | BOOK_UPDATE=3 |
+| `templateId` | ORDER_EVENT=2 |
+| `action` | UPSERT=1 |
+| `reason` | FILLED=4, CANCELLED=5, or EXPIRED=6 per mapping above |
+| `qtyMantissa/Scale` | parsed from `remaining_size` (0 for filled) |
+| `oldQtyMantissa/Scale` | 0, 0 |
+| `priceMantissa/Scale` | parsed from `price`; absent (market) → 0, 0 |
+
+**Remove order from book** regardless of `reason`.
+
+---
+
+#### `activate` — Stop Order Triggered
+
+```json
+{
+  "type": "activate",
+  "product_id": "BTC-USD",
+  "sequence": 10000005,
+  "order_id": "e3bc6f00-1234-5678-abcd-ef0123456789",
+  "side": "buy",
+  "stop_type": "entry",
+  "stop_price": "335.00",
+  "time": "2023-02-09T20:33:10.000000Z"
+}
+```
+
+**Encoding rule:**
+
+| SBE field | Value |
+|---|---|
+| `eventType` | BOOK_UPDATE=3 |
+| `templateId` | ORDER_EVENT=2 |
+| `action` | UPSERT=1 |
+| `reason` | TRIGGERED=2 |
+| `orderType` | STOP=3 |
+| `priceMantissa/Scale` | parsed from `stop_price` if present; 0 otherwise |
+| `qtyMantissa/Scale` | 0, 0 — stop not yet on book as active order |
+| `oldQtyMantissa/Scale` | 0, 0 |
+
+**Do not touch the order book.** The resulting active order arrives via
+a subsequent `received` → `open` sequence.
+
+---
+
+#### `change` — Order Quantity Modified
+
+```json
+{
+  "type": "change",
+  "time": "2023-02-09T20:33:10.100000Z",
+  "sequence": 10000006,
+  "order_id": "ac928c66-ca53-498f-9c13-a110027a60e8",
+  "product_id": "BTC-USD",
+  "new_size": "5.23512",
+  "old_size": "12.00000",
+  "price": "400.23",
+  "side": "buy"
+}
+```
+
+**Encoding rule:**
+
+| SBE field | Value |
+|---|---|
+| `eventType` | BOOK_UPDATE=3 |
+| `templateId` | ORDER_EVENT=2 |
+| `action` | UPSERT=1 |
+| `reason` | MODIFIED=3 |
+| `qtyMantissa/Scale` | parsed from `new_size` |
+| `oldQtyMantissa/Scale` | parsed from `old_size` |
+
+**Update order qty in book** from `old_size` to `new_size`. The downstream
+consumer can verify: if their current qty does not match `oldQtyMantissa`,
+their book state is inconsistent.
+
+`change` is NOT sent for size reductions due to partial fills — those are
+reflected solely through `match` messages.
+
+---
+
+#### `match` — Trade Occurred
+
+```json
+{
+  "type": "match",
+  "trade_id": 10,
+  "sequence": 10000007,
+  "maker_order_id": "ac928c66-ca53-498f-9c13-a110027a60e8",
+  "taker_order_id": "132fb6ae-456b-4654-b4e0-d681ac05cea1",
+  "time": "2023-02-09T20:33:10.200000Z",
+  "product_id": "BTC-USD",
+  "size": "5.23512",
+  "price": "400.23",
+  "side": "sell"
+}
+```
+
+`side` is the **taker's** side. Maker side is always opposite:
+
+| `side` | Taker | Maker |
+|---|---|---|
+| `"buy"` | BID=1 | ASK=2 |
+| `"sell"` | ASK=2 | BID=1 |
+
+**Encoding rule:**
+
+| SBE field | Value |
+|---|---|
+| `eventType` | BOOK_TRADE=4 |
+| `templateId` | TRADE_EVENT=3 |
+| `entryCount` | 1 |
+| `makerOrderIdHigh/Low` | parsed from `maker_order_id` UUID |
+| `takerOrderIdHigh/Low` | parsed from `taker_order_id` UUID |
+| `side` | taker side — `"buy"` → BID=1, `"sell"` → ASK=2 |
+| `priceMantissa/Scale` | parsed from `price` |
+| `qtyMantissa/Scale` | parsed from `size` (traded amount, same for both orders) |
+
+`trade_id` is not encoded — not needed for book maintenance or gap detection.
+
+**Reduce the maker's resting quantity** by `size`. A `done` message follows
+when the maker order is fully consumed. The gateway encodes both faithfully.
+
+Note: a `match` does NOT mean either order is done. The maker may still have
+remaining quantity. Only the subsequent `done` message confirms removal.
+
+---
+
+
+### 15.6 REST Snapshot (L3)
+
+`CoinbaseL3SnapshotStrategy` implements `REST_THEN_DELTA` using the algorithm
+defined in Section 5.5 (the `SnapshotStrategy.Mode` javadoc).
+
+**REST endpoint (authenticated):**
+```
+GET https://api.exchange.coinbase.com/products/{product_id}/book?level=3
+```
+Authentication: same HMAC-SHA256 scheme as WebSocket, signing
+`timestamp + "GET" + "/products/{product_id}/book?level=3"`.
+
+**REST response schema:**
+```json
+{
+  "sequence": 13051505638,
+  "bids": [
+    ["333.98", "5.72036512", "da863862-25f4-4868-ac41-005d11ab0a5f"],
+    ["333.98", "1.00000000", "132fb6ae-456b-4654-b4e0-d681ac05cea1"]
+  ],
+  "asks": [
+    ["333.99", "5.53755506", "100f8f36-7a57-4fc6-a0a9-6e39aa3f7fc4"]
+  ]
+}
+```
+
+Each entry is `[price, size, order_id]`. Multiple orders can rest at the same
+price — each has its own `order_id`. Side is implied by array (`bids` → BID,
+`asks` → ASK) — there is no explicit `side` field in snapshot entries.
+
+**Encoding the REST snapshot:**
+
+| SBE field | Value |
+|---|---|
+| `eventType` | BOOK_SNAPSHOT=2 |
+| `templateId` | ORDER_EVENT=2 |
+| `action` | UPSERT=1 for every entry |
+| `reason` | OPEN=1 — all snapshot entries are resting orders |
+| `orderType` | LIMIT=1 for all entries |
+| `orderIdHigh/Low` | UUID parsed from `order_id` per parsing rule |
+| `side` | `bids` array → BID=1; `asks` array → ASK=2 |
+| `priceMantissa/Scale` | parsed from `price` |
+| `qtyMantissa/Scale` | parsed from `size` |
+| `oldQtyMantissa/Scale` | 0, 0 |
+| `orderTimestamp` | -1 |
+| `exchangeTimestamp` | -1 (REST response carries no per-book timestamp) |
+| `gatewayMessageSeq` | `ctx.sequenceTracker().next()` |
+| `seq1` | REST response `sequence` value (snapshot boundary) |
+| `seq2` | same as `seq1` |
+
+**Delta alignment (per the REST_THEN_DELTA algorithm in Section 5.5):**
+- REST response `sequence` field = N (the snapshot boundary)
+- WS deltas buffered from `triggerSnapshot()` call: filter and replay per
+  Section 5.5 algorithm — discard deltas where `sequence <= N`, find and
+  apply the first delta that bridges the boundary
+- Each replayed delta is encoded as a separate `BOOK_UPDATE` (ORDER_EVENT
+  or TRADE_EVENT per message type) in arrival order
+- After the aligned buffer is drained: `snapshotGatekeeper().accept()` and
+  `onSnapshotBoundaryAccepted()`
+
+---
+
+### 15.7 Sequence Mapping (COINBASE_L3)
+
+Unlike `COINBASE_L2` (which has no exchange sequence), the Coinbase `full`
+channel carries a monotonically increasing per-product `sequence` field on
+every message. This spec encodes it into `seq1`/`seq2` so downstream consumers
+can detect exchange-level sequence gaps.
+
+| Field | Value |
+|---|---|
+| `gatewayMessageSeq` | `ctx.sequenceTracker().next()` — gateway per-session counter |
+| `seq1` | `message.sequence` — Coinbase per-product event counter |
+| `seq2` | `message.sequence` — same (each message covers one event) |
+
+The gateway does not itself detect gaps in the exchange sequence — liveness
+is maintained through heartbeat timeout. If a downstream consumer detects a
+gap in `seq1`/`seq2`, it may send a `RESYNC` recovery request (Section 22).
+
+For the REST snapshot message: `seq1 = seq2 = REST response sequence value`
+(the snapshot boundary sequence number).
+
+---
+
+### 15.8 Parsing Notes (COINBASE_L3)
+
+- `product_id` must match the connector's configured instrument; mismatch →
+  `productIdMismatches` counter, no publish
+- Pre-snapshot messages (before `snapshotGatekeeper().isReady()`) are dropped;
+  `preSnapshotDrops` incremented; no recovery triggered
+- `activate` messages are encoded as `ORDER_EVENT` with `reason=TRIGGERED=2`;
+  they do not modify the book but are passed through so downstream consumers
+  can track stop order lifecycle
+- Parser is stateless — no session state in fields
+- Parser must tolerate extra fields and must not assume field ordering
+- UUID order ID extraction must not allocate a `String` or `UUID` object on
+  the hot path — parse the UUID hex digits directly from `ByteBuf` into two
+  `long` values (`orderIdHigh`, `orderIdLow`) — see Section 18 for the rule
+- Missing or blank `price` field (market orders) → `priceMantissa=0,
+  priceScale=0`; do not treat as malformed
+- Missing or blank `size` field (market orders with `funds`) → `qtyMantissa=0,
+  qtyScale=0`; do not treat as malformed
+- `match` messages use `TRADE_EVENT` template (templateId=3) with
+  `eventType=BOOK_TRADE=4` — not `ORDER_EVENT`; the parser must encode these
+  using `SbeEncoder.writeTrade()` not `writeOrder()`
+- `done` `reason` field must be read and mapped to the SBE reason code —
+  it is no longer diagnostic-only; see Section 15.5 reason mapping table
+- `old_size` in `change` must be encoded into `oldQtyMantissa`/`oldQtyScale`
+  — it is no longer discarded
+
+---
+
+### 15.9 Fixture Files (COINBASE_L3)
+
+All fixtures live under `src/test/resources/venue/coinbase/l3/`.
+
+**REST snapshot:**
+- `snapshot_rest.json`:
+  - Valid REST response with `sequence`, `bids`, and `asks` arrays
+  - At least two bid entries at the same price (different `order_id`) and one ask entry
+  - All entries have valid UUID `order_id`
+  - Expected encoded output: `BOOK_SNAPSHOT`, `venue=COINBASE_L3` (byte 2),
+    `bookDepth=3`, `templateId=ORDER_EVENT=2`,
+    `entryCount = bid count + ask count`,
+    all entries `action=UPSERT`, `reason=OPEN=1`, `orderType=LIMIT`
+  - `seq1 = seq2 = REST response sequence value`
+
+**Order lifecycle happy-path:**
+- `received.json`:
+  - `type="received"`, valid UUID `order_id`, `side="buy"`, `order_type="limit"`,
+    non-zero `price` and `size`
+  - Expected: `BOOK_UPDATE`, `templateId=ORDER_EVENT`, `action=UPSERT`,
+    `reason=RECEIVED=0`, `side=BID`, `orderType=LIMIT`,
+    correct `orderIdHigh/Low` (full UUID, not truncated), correct mantissa/scale
+- `received_market_order.json`:
+  - `type="received"`, `order_type="market"`, `funds` present, absent `price` and `size`
+  - Expected: `BOOK_UPDATE`, `reason=RECEIVED=0`, `orderType=MARKET`,
+    `priceMantissa=0`, `priceScale=0`, `qtyMantissa=0`, `qtyScale=0`
+- `open.json`:
+  - `type="open"`, valid `order_id`, `side="sell"`, non-zero `remaining_size` and `price`
+  - Expected: `BOOK_UPDATE`, `reason=OPEN=1`, `side=ASK`, `orderType=LIMIT`,
+    `qtyMantissa` from `remaining_size`
+- `done_filled.json`:
+  - `type="done"`, `reason="filled"`, `remaining_size="0.00000000"`
+  - Expected: `BOOK_UPDATE`, `reason=FILLED=4`, `action=UPSERT`, `qtyMantissa=0`
+- `done_cancelled.json`:
+  - `type="done"`, `reason="canceled"`, non-zero `remaining_size`
+  - Expected: `BOOK_UPDATE`, `reason=CANCELLED=5`, `action=UPSERT`,
+    correct `qtyMantissa` from `remaining_size`
+- `activate.json`:
+  - `type="activate"`, valid UUID `order_id`, `stop_price`, `side="buy"`
+  - Expected: `BOOK_UPDATE`, `templateId=ORDER_EVENT`, `reason=TRIGGERED=2`,
+    `orderType=STOP`, `priceMantissa` from `stop_price`, `qtyMantissa=0`
+- `match.json`:
+  - `type="match"`, valid `maker_order_id` and `taker_order_id`, `side="sell"`,
+    non-zero `price` and `size`
+  - Expected: `BOOK_TRADE=4`, `templateId=TRADE_EVENT=3`, `entryCount=1`;
+    `makerOrderIdHigh/Low` from maker UUID, `takerOrderIdHigh/Low` from taker UUID,
+    `side=ASK` (taker side for `"sell"`), correct `priceMantissa/Scale`,
+    correct `qtyMantissa/Scale`
+- `change.json`:
+  - `type="change"`, valid `order_id`, `new_size="5.23512"`, `old_size="12.00000"`
+  - Expected: `BOOK_UPDATE`, `reason=MODIFIED=3`, `action=UPSERT`,
+    `qtyMantissa` from `new_size`, `oldQtyMantissa` from `old_size`,
+    both with correct scale values
+
+**Control-plane:**
+- `subscriptions_ack.json`:
+  - Contains `full` and `heartbeat` channels for `BTC-USD`
+- `subscriptions_ack_missing_full.json`:
+  - Missing `full` channel → `subscriptionValidationFailures` increments, recovery triggered
+- `subscriptions_ack_missing_heartbeat.json`:
+  - Missing `heartbeat` channel → same failure path
+- `subscriptions_ack_wrong_product.json`:
+  - Correct channel names, wrong `product_id` → failure path
+- `heartbeat.json`:
+  - `type="heartbeat"`, matching `product_id`
+  - Expected: heartbeat counters updated, no SBE publish
+- `error_message.json`:
+  - `{"type":"error","message":"Failed to subscribe","reason":"authentication failure"}`
+  - Expected: `authenticationErrors` increments, recovery triggered
+
+**Drop/rejection:**
+- `received_wrong_product.json`:
+  - Valid shape, wrong `product_id`
+  - Expected: `productIdMismatches` increments, no publish
+- `unknown_type.json`:
+  - Well-formed JSON with unsupported `type` value
+  - Expected: `unknownTypeDrops` increments, no publish
+- `malformed.json`:
+  - Truncated or structurally invalid JSON
+  - Expected: `malformedRejections` increments, no publish
+- `bad_decimal.json`:
+  - Valid envelope but scientific-notation or overflow price/size
+  - Expected: `malformedRejections` increments, no publish
+- `done_before_snapshot.json`:
+  - Valid `done` message before snapshot gate is open
+  - Expected: `preSnapshotDrops` increments, no publish
+
+**Recovery:**
+- `recovery_snapshot_rest.json`:
+  - Same contract as `snapshot_rest.json`, used after reset/reconnect/resubscribe
+- `recovery_open.json`:
+  - Valid `open` used before and after recovery snapshot to verify pre-snapshot
+    drops and post-snapshot publishing
+
+---
+
+
+### 15.10 Acceptance Criteria (COINBASE_L3)
+
+These criteria are additive to Phases 1–3 criteria (all of which continue to
+apply to `COINBASE_L2`). They are the Phase 4 gate.
+
+- **AC-L3-1**: The gateway connects, authenticates, subscribes to `full` and
+  `heartbeat` for a configured instrument, and receives inbound messages.
+
+- **AC-L3-2**: A REST snapshot is parsed and published as `BOOK_SNAPSHOT` with
+  `venue=COINBASE_L3` (byte 2), `bookDepth=3`, `templateId=ORDER_EVENT=2`,
+  correct `entryCount`, every entry `reason=OPEN=1`, `action=UPSERT=1`,
+  correct full UUID in `orderIdHigh/Low`, correct mantissa/scale. `seq1=seq2=`
+  REST response `sequence` value. No `String` or `UUID` object allocated.
+
+- **AC-L3-3**: `received` messages are encoded as `BOOK_UPDATE` /
+  `ORDER_EVENT` with `reason=RECEIVED=0`, `action=UPSERT=1`. `side` and
+  `orderType` mapped correctly. Market orders with absent `price` or `size`
+  encode 0 for those fields without treating the message as malformed.
+
+- **AC-L3-4**: `open` messages are encoded as `BOOK_UPDATE` / `ORDER_EVENT`
+  with `reason=OPEN=1`, `action=UPSERT=1`, `orderType=LIMIT=1`,
+  `qtyMantissa` from `remaining_size`.
+
+- **AC-L3-5**: `done` messages are encoded as `BOOK_UPDATE` / `ORDER_EVENT`
+  with `action=UPSERT=1` and `reason` mapped from the Coinbase `reason` field:
+  `"filled"` → `FILLED=4`, `"canceled"` → `CANCELLED=5` (or `EXPIRED=6` for
+  TIF expiry). `qtyMantissa` from `remaining_size`.
+
+- **AC-L3-6**: `activate` messages are encoded as `BOOK_UPDATE` / `ORDER_EVENT`
+  with `reason=TRIGGERED=2`, `orderType=STOP=3`, `priceMantissa` from
+  `stop_price`. They do not modify the downstream book.
+
+- **AC-L3-7**: `change` messages are encoded as `BOOK_UPDATE` / `ORDER_EVENT`
+  with `reason=MODIFIED=3`, `action=UPSERT=1`, `qtyMantissa` from `new_size`,
+  `oldQtyMantissa` from `old_size`. Both quantities encoded with correct scale.
+
+- **AC-L3-8**: `match` messages are encoded as `BOOK_TRADE=4` /
+  `TRADE_EVENT=3` with `entryCount=1`. `makerOrderIdHigh/Low` from
+  `maker_order_id`, `takerOrderIdHigh/Low` from `taker_order_id`. `side` is
+  taker side. Maker side is always opposite to message `side` field (derivable
+  by downstream consumer — not stored in TRADE_EVENT).
+
+- **AC-L3-9**: All UUID order ID fields (`orderIdHigh/Low`,
+  `makerOrderIdHigh/Low`, `takerOrderIdHigh/Low`) encode the full 128-bit UUID
+  as two `uint64` values. No truncation. No `String` or `UUID` allocation on
+  the hot path.
+
+- **AC-L3-10**: Pre-snapshot order lifecycle messages are dropped
+  (`preSnapshotDrops` increments); no recovery triggered.
+
+- **AC-L3-11**: REST_THEN_DELTA delta alignment: buffered deltas replayed in
+  order after alignment; stale deltas discarded per Section 5.5 algorithm.
+
+- **AC-L3-12**: REST_THEN_DELTA ring buffer overflow triggers stream integrity
+  failure and recovery.
+
+- **AC-L3-13**: After recovery: `BOOK_RESET` → `BOOK_SNAPSHOT` → aligned
+  `BOOK_UPDATE`/`BOOK_TRADE` messages → live messages. No interleaving.
+
+- **AC-L3-14**: `subscriptions` ack validated for `full` and `heartbeat`.
+  Missing channel or wrong `product_id` triggers recovery.
+
+- **AC-L3-15**: `error` frames increment `authenticationErrors` and trigger
+  immediate recovery.
+
+- **AC-L3-16**: Heartbeat liveness timeout triggers recovery (same algorithm
+  as `COINBASE_L2`).
+
+- **AC-L3-17**: `CoinbaseL3FeedParser` produces no per-message heap allocation
+  on the hot path. UUID parsing, price/size parsing, and encoder writes do
+  not allocate.
+
+- **AC-L3-18**: `SbeEncoder` schema version=2, body=51 bytes, BOOK_RESET=59
+  bytes. `SbeDecoder` in tests uses `blockLength=51` to locate repeating group.
+
+- **AC-L3-19**: `seq1=seq2=message.sequence` (exchange sequence) for all
+  L3 messages including `match`. `gatewayMessageSeq` = gateway counter.
+
+- **AC-L3-20**: Core classes modified for Phase 4 are limited to `SbeEncoder`
+  (add `writeTrade()`, update body constants) and `EncodingConstants`
+  (new constants for schema v2). No other `core/` class is modified.
+  Verified by `git diff --name-only`.
+
+- **AC-L3-21**: All Phase 1–3 acceptance criteria continue to pass for
+  `COINBASE_L2` after Phase 4 changes are introduced.
+
+---
+
+#### `CoinbaseL3FeedParserTest` — unit, `@Tag("unit")`
+
+**Parser positive cases:**
+```
+onTextFrame_received_limitOrder_reasonReceivedZero
+onTextFrame_received_limitOrder_buyEncodesAsBid
+onTextFrame_received_limitOrder_sellEncodesAsAsk
+onTextFrame_received_orderTypeLimitEncoded
+onTextFrame_received_orderTypeMarketEncoded
+onTextFrame_received_orderTypeStopEncoded
+onTextFrame_received_marketOrder_priceMantissaZero_qtyMantissaZero
+onTextFrame_received_fullUuidInOrderIdHighAndLow
+onTextFrame_received_timestampFromTimeField
+onTextFrame_open_reasonOpenOne
+onTextFrame_open_qtyFromRemainingSize
+onTextFrame_open_orderTypeForcedToLimit
+onTextFrame_done_filledReason_mapsToFilledFour
+onTextFrame_done_cancelledReason_mapsToCancelledFive
+onTextFrame_done_remainingSizeEncodedInQtyMantissa
+onTextFrame_done_missingPrice_priceMantissaZero
+onTextFrame_activate_reasonTriggeredTwo
+onTextFrame_activate_orderTypeStop
+onTextFrame_activate_stopPriceEncoded
+onTextFrame_activate_qtyMantissaZero
+onTextFrame_change_reasonModifiedThree
+onTextFrame_change_newSizeInQtyMantissa
+onTextFrame_change_oldSizeInOldQtyMantissa
+onTextFrame_change_bothScalesEncoded
+onTextFrame_match_eventTypeIsBookTrade
+onTextFrame_match_templateIdIsTradeEvent
+onTextFrame_match_entryCountIsOne
+onTextFrame_match_makerOrderIdHighAndLowFromMakerUuid
+onTextFrame_match_takerOrderIdHighAndLowFromTakerUuid
+onTextFrame_match_sideIsTakerSide_sellEncodesAsAsk
+onTextFrame_match_sideIsTakerSide_buyEncodesAsBid
+onTextFrame_match_priceAndQtyEncoded
+onTextFrame_heartbeat_updatesLastHeartbeatNanos
+onTextFrame_heartbeat_incrementsCounter
+onTextFrame_heartbeat_doesNotPublish
+onTextFrame_subscriptionsAck_bothChannelsPresent_passes
+onTextFrame_subscriptionsAck_seedsLastHeartbeatNanos
+```
+
+**Parser negative/edge cases:**
+```
+onTextFrame_received_wrongProductId_droppedAndCounted
+onTextFrame_open_wrongProductId_droppedAndCounted
+onTextFrame_done_wrongProductId_droppedAndCounted
+onTextFrame_activate_wrongProductId_droppedAndCounted
+onTextFrame_match_wrongProductId_droppedAndCounted
+onTextFrame_change_wrongProductId_droppedAndCounted
+onTextFrame_heartbeat_wrongProductId_droppedAndCounted
+onTextFrame_anyMessage_beforeSnapshot_preSnapshotDropIncremented_noPublish
+onTextFrame_unknownType_countedAndDropped
+```
+
+**Parser failure/exception cases:**
+```
+onTextFrame_malformedJson_incrementsMalformedRejections
+onTextFrame_badDecimalPrice_incrementsMalformedRejections_noPublish
+onTextFrame_badDecimalSize_incrementsMalformedRejections_noPublish
+onTextFrame_missingOrderId_incrementsMalformedRejections
+onTextFrame_missingType_incrementsMalformedRejections
+onTextFrame_emptyFrame_handledGracefully
+onTextFrame_errorMessage_incrementsAuthErrors_triggersRecovery
+onTextFrame_subscriptionsAck_missingFullChannel_triggersRecovery
+onTextFrame_subscriptionsAck_missingHeartbeatChannel_triggersRecovery
+onTextFrame_subscriptionsAck_wrongProduct_triggersRecovery
+```
+
+**Parser negative/edge cases:**
+```
+onTextFrame_received_wrongProductId_droppedAndCounted
+onTextFrame_open_wrongProductId_droppedAndCounted
+onTextFrame_done_wrongProductId_droppedAndCounted
+onTextFrame_match_wrongProductId_droppedAndCounted
+onTextFrame_change_wrongProductId_droppedAndCounted
+onTextFrame_heartbeat_wrongProductId_droppedAndCounted
+onTextFrame_anyMessage_beforeSnapshot_preSnapshotDropIncremented_noPublish
+onTextFrame_activate_encoded_notDropped
+onTextFrame_unknownType_countedAndDropped
+```
+
+**Parser failure/exception cases:**
+```
+onTextFrame_malformedJson_incrementsMalformedRejections
+onTextFrame_badDecimalPrice_incrementsMalformedRejections_noPublish
+onTextFrame_badDecimalSize_incrementsMalformedRejections_noPublish
+onTextFrame_missingOrderId_incrementsMalformedRejections
+onTextFrame_missingType_incrementsMalformedRejections
+onTextFrame_emptyFrame_handledGracefully
+onTextFrame_errorMessage_incrementsAuthErrors_triggersRecovery
+onTextFrame_subscriptionsAck_missingFullChannel_triggersRecovery
+onTextFrame_subscriptionsAck_missingHeartbeatChannel_triggersRecovery
+onTextFrame_subscriptionsAck_wrongProduct_triggersRecovery
+```
+
+#### `CoinbaseL3SnapshotStrategyTest` — unit, `@Tag("unit")`
+
+```
+mode_returnsRestThenDelta
+triggerSnapshot_opensRingBufferBeforeRestFetch
+triggerSnapshot_issuesAsyncRestFetchOnNonEventLoopThread
+restResponse_parsed_publishedAsBookSnapshot
+restResponse_bids_encodedWithSideBid
+restResponse_asks_encodedWithSideAsk
+restResponse_allEntries_actionUpsert
+restResponse_allEntries_orderTypeLimit
+restResponse_exchangeTimestampMinusOne
+restResponse_deltaAlignment_staleDeltas_discarded
+restResponse_deltaAlignment_boundaryDelta_included
+restResponse_deltaAlignment_gapDetected_triggersRecovery
+restResponse_ringBufferFull_triggersStreamIntegrityFailure
+restResponse_sequenceGap_inBufferedDeltas_triggersRecovery
+snapshotGatekeeper_openedAfterBufferDrained
+onSnapshotBoundaryAccepted_calledAfterGatekeeperOpen
+```
+
+#### `CoinbaseL3RecoveryStrategyTest` — unit, `@Tag("unit")`
+
+```
+execute_happyPath_callsAllFourStepsInOrder
+execute_onChannelRestored_calledExactlyOnce
+execute_doReconnectFails_callsOnRecoveryFailed
+execute_doResubscribeFails_callsOnRecoveryFailed
+execute_incrementsRecoveryExecutionsCounter
+execute_subscribesToFullAndHeartbeatChannels
+reconnectWithBackoff_shutdownRequested_exits
+reconnectWithBackoff_exponentialBackoffApplied
+```
+
+#### `CoinbaseL3SubscriptionBuilderTest` — unit, `@Tag("unit")`
+
+```
+buildSubscribe_typeIsSubscribe
+buildSubscribe_containsFullChannel
+buildSubscribe_containsHeartbeatChannel
+buildSubscribe_productIdMatchesInstrument
+buildSubscribe_signatureIsNonEmpty
+buildSubscribe_allAuthFieldsPresent
+buildUnsubscribe_typeIsUnsubscribe
+```
+
+#### `CoinbaseL3ConnectorIntegrationTest` — integration, `@Tag("integration")`
+
+```
+init_allocatesEncoderWithOrderEventTemplate
+init_allocatesSeparateTradeEventBuffer
+init_doesNotHoldConnectorContext
+init_countersArePerInstrument
+connect_sendSubscribeCalledWithFullAndHeartbeat
+shutdown_sendsUnsubscribeBeforeClose
+shutdown_publishesBookResetBeforeClose
+shutdown_bookResetIs59Bytes_schemaVersion2
+shutdown_bookResetHasCorrectVenueBookDepthTemplate
+buildSessionContexts_parseCtxAndSnapshotCtxShareSameGatekeeper
+onChannelRestored_resetsSequenceTrackerToZero
+onSnapshotAccepted_clearsRecoveryInProgress
+onSnapshotAccepted_incrementsRecoveryCompletions
+recover_publishesBookResetWithOrderEventTemplate
+recover_recoveryInProgressFlagSetBeforeExecute
+recover_whileInProgress_secondRequestIgnored
+backpressure_allRetriesExhausted_triggersRecovery
+checkLiveness_heartbeatExpired_triggersRecovery
+checkLiveness_shutdownRequested_noAction
+orderEventTemplate_bookDepthIsThree
+orderEventTemplate_templateIdIsOrderEvent
+orderEventTemplate_bodyIs51Bytes
+tradeEventTemplate_entryIs51Bytes
+schemaVersion_isTwo
+onlyCorClassesModified_areSbeEncoderAndEncodingConstants
+```
+
+#### `CoinbaseL3EndToEndTest` — end-to-end, `@Tag("e2e")`
+
+Uses `CoinbaseExchangeSimulator` + a REST mock server (e.g. `MockWebServer`
+from OkHttp, or an embedded Jetty instance) for the snapshot endpoint.
+
+**Happy-path scenarios:**
+```
+e2e_connectSubscribeAckSnapshotOrders_allPublishedCorrectly
+e2e_restSnapshot_encodedAsBookSnapshot_correctFields
+e2e_restSnapshot_bidsAndAsks_allEncodedWithCorrectSide
+e2e_liveReceived_afterSnapshot_encodedAsUpsert
+e2e_liveOpen_afterSnapshot_encodedAsUpsert
+e2e_liveDone_afterSnapshot_encodedAsDelete
+e2e_liveMatch_afterSnapshot_twoEntriesInOneMessage
+e2e_liveChange_afterSnapshot_quantityUpdated
+e2e_wireFormat_bookSnapshot_correctLittleEndianLayout
+e2e_wireFormat_bookUpdate_orderEntry29BytesPerEntry
+e2e_wireFormat_bookReset_correct55ByteLayout_orderEntryTemplate
+e2e_gatewayMessageSeq_monotonicFromOne
+e2e_counters_allExpectedCountersNonZeroAfterHappyPath
+```
+
+**Pre-snapshot drop scenarios:**
+```
+e2e_ordersBeforeSnapshot_allDropped_noPublish
+e2e_preSnapshotDropCounter_incrementsForEachDroppedOrder
+```
+
+**Recovery scenarios:**
+```
+e2e_recovery_connectionDrop_publishesResetThenSnapshotThenOrders
+e2e_recovery_multipleDrops_eachCompletesCleanly
+e2e_recovery_heartbeatTimeout_triggersRecovery
+e2e_recovery_errorFrame_triggersRecovery
+e2e_recovery_subscriptionsAckMissingChannel_triggersRecovery
+e2e_recovery_ringBufferOverflow_triggersRecovery
+e2e_recovery_deltaGap_triggersRecovery
+e2e_recovery_messageOrderAfterRecovery_resetSnapshotUpdate
+```
+
+**Protocol violation scenarios:**
+```
+e2e_malformedFrame_incrementsCounterNoPublish
+e2e_unknownType_incrementsCounterNoPublish
+e2e_activateMessage_countedAsUnknownType
+e2e_wrongProductId_incrementsCounterNoPublish
+e2e_badDecimalInPrice_malformedCounterIncrements
+```
+
+**Structural validation:**
+```
+e2e_noCorClassModified_verifiedByPresenceOfL3FilesOnly
+e2e_serviceLoader_discoversL3Factory
+e2e_archUnit_l3PackageContainsAllRequiredClasses
+```
+
+---
+
+## 16. Threading Model
+
 
 ### Core Principle: One Connection, One Thread, One Instrument
 
@@ -3476,7 +4393,7 @@ before execution — never executed directly from an off-thread caller.
 
 ---
 
-## 16. Normalized Binary Model
+## 17. Normalized Binary Model
 
 ### Sequence Fields
 
@@ -3522,10 +4439,20 @@ Required ordering: `BOOK_RESET` → `BOOK_SNAPSHOT` → `BOOK_UPDATE`. No interl
 
 ---
 
-## 17. Binary Encoding Model
+## 18. Binary Encoding Model
 
 ### Style
 SBE-style (not generated SBE) — hand-written encoder and decoder.
+
+### Schema Version
+
+**Current version: 2** (incremented from 1 to introduce the `checksum` body
+field, `ORDER_EVENT` template, and `TRADE_EVENT` template required for L3
+support and cross-exchange CRC integrity verification).
+
+Decoders must reject messages with `version > known_version`. Version 1 decoders
+must reject version 2 messages. Version 2 is not backward-compatible with
+version 1. A coordinated deployment is required when upgrading.
 
 ### Layout
 
@@ -3533,181 +4460,294 @@ SBE-style (not generated SBE) — hand-written encoder and decoder.
 [Header]     magic, version, templateId, blockLength, entryCount
 [Body]       eventType, venue, bookDepth, instrumentId,
              gatewayMessageSeq, seq1, seq2,
-             exchangeTimestamp, ingressTimestamp
-[Repeating]  one entry per level (BOOK_LEVEL template)
-             or one entry per order (ORDER_ENTRY template)
+             exchangeTimestamp, ingressTimestamp, checksum
+[Repeating]  one entry per level   (BOOK_LEVEL  templateId=1)
+             one entry per event   (ORDER_EVENT templateId=2)
+             one entry per trade   (TRADE_EVENT templateId=3)
 ```
+
+The decoder reads `templateId` from the header to determine which repeating
+group layout to apply. `eventType` in the body determines the semantic meaning:
+
+| `eventType` | `templateId` allowed | Meaning |
+|---|---|---|
+| BOOK_RESET=1 | 1, 2, 3 | Downstream must discard current state |
+| BOOK_SNAPSHOT=2 | 1, 2 | Fresh authoritative book image |
+| BOOK_UPDATE=3 | 1, 2 | Incremental book change |
+| BOOK_TRADE=4 | 3 only | Trade event (match); two orders involved |
 
 ### Field Sizes — Little-Endian
 
 **Header (8 bytes total)**
 
-| Field | Type | Bytes | Notes |
+| Field | Offset | Type | Bytes | Notes |
+|---|---|---|---|---|
+| `magic` | 0 | `uint16` | 2 | Fixed protocol marker `0xEB0B` (little-endian: `0B EB`). Reject if not `0xEB0B`. |
+| `version` | 2 | `uint8` | 1 | Schema version = **2**. Reject if `version > known_version`. |
+| `templateId` | 3 | `uint8` | 1 | BOOK_LEVEL=1, ORDER_EVENT=2, TRADE_EVENT=3 |
+| `blockLength` | 4 | `uint16` | 2 | Fixed body length = 51. Use to locate repeating group. |
+| `entryCount` | 6 | `uint16` | 2 | Number of repeating group entries. |
+
+**Body (51 bytes total, starting at offset 8)**
+
+| Field | Offset | Type | Bytes | Notes |
+|---|---|---|---|---|
+| `eventType` | 8 | `uint8` | 1 | BOOK_RESET=1, BOOK_SNAPSHOT=2, BOOK_UPDATE=3, BOOK_TRADE=4 |
+| `venue` | 9 | `uint8` | 1 | See Section 24 for allocation table |
+| `bookDepth` | 10 | `uint8` | 1 | L1=1, L2=2, L3=3 |
+| `instrumentId` | 11 | `uint32` | 4 | Stable configured internal ID |
+| `gatewayMessageSeq` | 15 | `uint64` | 8 | Gateway monotonic per-session counter |
+| `seq1` | 23 | `uint64` | 8 | Start sequence (venue-specific source) |
+| `seq2` | 31 | `uint64` | 8 | End sequence (venue-specific source) |
+| `exchangeTimestamp` | 39 | `int64` | 8 | Epoch nanoseconds, or -1 if absent |
+| `ingressTimestamp` | 47 | `int64` | 8 | Gateway receive time, epoch nanoseconds |
+| `checksum` | 55 | `uint32` | 4 | CRC32 integrity check (Kraken, OKX); 0 = not provided by this venue |
+
+Repeating group entries begin at offset **59** (8 header + 51 body).
+
+---
+
+**Repeating Group — `BOOK_LEVEL` template (templateId=1) — L1/L2 — 20 bytes per entry**
+
+| Field | Entry offset | Type | Bytes | Notes |
+|---|---|---|---|---|
+| `side` | 0 | `uint8` | 1 | BID=1, ASK=2 |
+| `action` | 1 | `uint8` | 1 | UPSERT=1, DELETE=2 |
+| `priceScale` | 2 | `uint8` | 1 | Decimal scale for priceMantissa |
+| `qtyScale` | 3 | `uint8` | 1 | Decimal scale for qtyMantissa |
+| `priceMantissa` | 4 | `int64` | 8 | Signed price mantissa |
+| `qtyMantissa` | 12 | `int64` | 8 | Signed quantity mantissa |
+
+Used with `eventType = BOOK_SNAPSHOT` or `BOOK_UPDATE` for L1/L2 venues.
+
+---
+
+**Repeating Group — `ORDER_EVENT` template (templateId=2) — L3 order lifecycle — 51 bytes per entry**
+
+| Field | Entry offset | Type | Bytes | Notes |
+|---|---|---|---|---|
+| `orderIdHigh` | 0 | `uint64` | 8 | Upper 64 bits of order ID (UUID high half, or first 8 ASCII bytes zero-padded) |
+| `orderIdLow` | 8 | `uint64` | 8 | Lower 64 bits of order ID (UUID low half, or next 8 ASCII bytes zero-padded) |
+| `side` | 16 | `uint8` | 1 | BID=1, ASK=2 |
+| `action` | 17 | `uint8` | 1 | Always UPSERT=1 for ORDER_EVENT — `reason` carries semantic meaning |
+| `reason` | 18 | `uint8` | 1 | See reason code table below |
+| `orderType` | 19 | `uint8` | 1 | UNKNOWN=0, LIMIT=1, MARKET=2, STOP=3 |
+| `priceScale` | 20 | `uint8` | 1 | Decimal scale for priceMantissa |
+| `qtyScale` | 21 | `uint8` | 1 | Decimal scale for qtyMantissa (new/current size) |
+| `oldQtyScale` | 22 | `uint8` | 1 | Decimal scale for oldQtyMantissa; 0 if not applicable |
+| `orderTimestamp` | 23 | `int64` | 8 | Per-order exchange timestamp ns (Kraken L3); -1 if not provided |
+| `priceMantissa` | 31 | `int64` | 8 | Signed price mantissa; 0 if absent (market orders) |
+| `qtyMantissa` | 39 | `int64` | 8 | New/current size mantissa |
+| `oldQtyMantissa` | 47 | `int64` | 8 | Previous size mantissa (MODIFIED only); 0 if not applicable |
+
+**`reason` codes for ORDER_EVENT:**
+
+| Code | Name | Book action | When used |
 |---|---|---|---|
-| `magic` | `uint16` | 2 | Fixed protocol marker — value `0xEB0B` (little-endian: `0B EB`). Decoders must reject any message where this field is not `0xEB0B`. |
-| `version` | `uint8` | 1 | Schema version — initial value `1`. Decoders must reject messages with `version > known_version`. Backward compatibility is not required; a schema change increments `version` and requires coordinated deployment. |
-| `templateId` | `uint8` | 1 | BOOK_LEVEL=1, ORDER_ENTRY=2 — determines repeating group layout |
-| `blockLength` | `uint16` | 2 | Fixed body length; use to locate repeating group |
-| `entryCount` | `uint16` | 2 | Number of repeating group entries — written by `SbeEncoder.endMessage()` for normal encoded messages, or written directly by the publisher reset encoder for `BOOK_RESET` |
+| 0 | RECEIVED | None — do not touch book | Order entered engine; not yet on book |
+| 1 | OPEN | Add order at price with qty | Order now resting on book |
+| 2 | TRIGGERED | None — informational | Stop order activated (Coinbase `activate`) |
+| 3 | MODIFIED | Update qty in book (old→new) | Order size changed (`change` message) |
+| 4 | FILLED | Remove from book | Fully consumed by trades |
+| 5 | CANCELLED | Remove from book | Removed by participant or system |
+| 6 | EXPIRED | Remove from book | Time-in-force not satisfied (IOC/FOK/GTD) |
+| 7 | REJECTED | None — was never on book | Rejected before book entry |
+| 8 | DELETE | Remove from book | Generic removal; venue reason not mapped |
 
-**Body (47 bytes total)**
+Used with `eventType = BOOK_SNAPSHOT` (REST snapshot entries) or
+`eventType = BOOK_UPDATE` (live order lifecycle events).
 
-| Field | Type | Bytes | Notes |
-|---|---|---|---|
-| `eventType` | `uint8` | 1 | BOOK_RESET=1, BOOK_SNAPSHOT=2, BOOK_UPDATE=3 |
-| `venue` | `uint8` | 1 | See Section 23 for allocation table |
-| `bookDepth` | `uint8` | 1 | L1=1, L2=2, L3=3 — depth level of this message |
-| `instrumentId` | `uint32` | 4 | Stable configured internal ID |
-| `gatewayMessageSeq` | `uint64` | 8 | Gateway monotonic per-session counter |
-| `seq1` | `uint64` | 8 | Start sequence (venue-specific source) |
-| `seq2` | `uint64` | 8 | End sequence (venue-specific source) |
-| `exchangeTimestamp` | `int64` | 8 | Epoch nanoseconds, or -1 if absent |
-| `ingressTimestamp` | `int64` | 8 | Gateway receive time, epoch nanoseconds |
+---
 
-**Repeating Group — `BOOK_LEVEL` template (L1 / L2) — 20 bytes per entry**
+**Repeating Group — `TRADE_EVENT` template (templateId=3) — L3 match — 51 bytes per entry**
 
-| Field | Type | Bytes | Notes |
-|---|---|---|---|
-| `side` | `uint8` | 1 | BID=1, ASK=2 |
-| `action` | `uint8` | 1 | UPSERT=1, DELETE=2 |
-| `priceScale` | `uint8` | 1 | Decimal scale for priceMantissa |
-| `qtyScale` | `uint8` | 1 | Decimal scale for qtyMantissa |
-| `priceMantissa` | `int64` | 8 | Signed price mantissa |
-| `qtyMantissa` | `int64` | 8 | Signed quantity mantissa |
+| Field | Entry offset | Type | Bytes | Notes |
+|---|---|---|---|---|
+| `makerOrderIdHigh` | 0 | `uint64` | 8 | Upper 64 bits of maker (resting) order ID |
+| `makerOrderIdLow` | 8 | `uint64` | 8 | Lower 64 bits of maker order ID |
+| `takerOrderIdHigh` | 16 | `uint64` | 8 | Upper 64 bits of taker (aggressive) order ID |
+| `takerOrderIdLow` | 24 | `uint64` | 8 | Lower 64 bits of taker order ID |
+| `side` | 32 | `uint8` | 1 | Taker side: BID=1, ASK=2. Maker side is always opposite. |
+| `priceScale` | 33 | `uint8` | 1 | Decimal scale for priceMantissa |
+| `qtyScale` | 34 | `uint8` | 1 | Decimal scale for qtyMantissa |
+| `priceMantissa` | 35 | `int64` | 8 | Signed trade price mantissa |
+| `qtyMantissa` | 43 | `int64` | 8 | Traded size mantissa (same for both orders) |
 
-**Repeating Group — `ORDER_ENTRY` template (L3) — 29 bytes per entry**
+Always `entryCount = 1`. Used exclusively with `eventType = BOOK_TRADE (4)`.
 
-| Field | Type | Bytes | Notes |
-|---|---|---|---|
-| `orderId` | `uint64` | 8 | Exchange-assigned stable order identifier |
-| `side` | `uint8` | 1 | BID=1, ASK=2 |
-| `action` | `uint8` | 1 | UPSERT=1 (new/modified), DELETE=2 (cancelled/filled) |
-| `orderType` | `uint8` | 1 | LIMIT=1, MARKET=2, STOP=3 |
-| `priceScale` | `uint8` | 1 | Decimal scale for priceMantissa |
-| `qtyScale` | `uint8` | 1 | Decimal scale for qtyMantissa |
-| `priceMantissa` | `int64` | 8 | Signed price mantissa |
-| `qtyMantissa` | `int64` | 8 | Signed remaining quantity mantissa |
+`trade_id` is not encoded — not needed for book maintenance or gap detection.
+If audit or reconciliation use cases require cross-referencing with exchange
+trade history, increment `version` and add a `tradeId uint64` field at that time.
+
+---
 
 ### Encoded Message Size Formulas
 
 ```
-Header:             8 bytes  (constant)
-Body:              47 bytes  (constant, includes bookDepth)
+Header:              8 bytes  (constant)
+Body:               51 bytes  (constant — blockLength field value)
 
-BOOK_LEVEL total:   8 + 47 + (entryCount × 20)
-ORDER_ENTRY total:  8 + 47 + (entryCount × 29)
+BOOK_LEVEL total:    8 + 51 + (entryCount × 20)
+ORDER_EVENT total:   8 + 51 + (entryCount × 51)  — entryCount is always 1 for live events
+TRADE_EVENT total:   8 + 51 + (1 × 51) = 110 bytes  (fixed — always 1 entry)
 ```
 
-Maximum supported entries per message: **10,000**
+Maximum supported entries per message: **10,000** (applies to BOOK_LEVEL and
+ORDER_EVENT templates; TRADE_EVENT is always 1 entry).
 
 Maximum encoded sizes:
 ```
-BOOK_LEVEL:   8 + 47 + (10,000 × 20) = 200,055 bytes
-ORDER_ENTRY:  8 + 47 + (10,000 × 29) = 290,055 bytes
+BOOK_LEVEL:    8 + 51 + (10,000 × 20)  = 200,059 bytes
+ORDER_EVENT:   8 + 51 + (10,000 × 51)  = 510,059 bytes  (L3 REST snapshot only)
+TRADE_EVENT:   8 + 51 + (1 × 51)       =     110 bytes  (fixed)
 ```
 
 Each `ConnectorFactory` sizes the encoder buffer for its template using the
-appropriate formula plus configured headroom bytes. A `COINBASE_L2` connector
-uses the `BOOK_LEVEL` formula. A `COINBASE_L3` connector uses the `ORDER_ENTRY`
-formula. The encoder is constructed with the right capacity — it never needs
-to know about the other template.
+appropriate formula plus configured headroom bytes:
+- `COINBASE_L2` → `BOOK_LEVEL` formula
+- `COINBASE_L3` → `ORDER_EVENT` formula (sized for REST snapshot entry count)
+- `TRADE_EVENT` is always 110 bytes; a separate fixed buffer is allocated
+
+---
 
 ### Enum Values
 
-**`eventType`**: BOOK_RESET=1, BOOK_SNAPSHOT=2, BOOK_UPDATE=3
+**`eventType`**: BOOK_RESET=1, BOOK_SNAPSHOT=2, BOOK_UPDATE=3, BOOK_TRADE=4
 
-**`venue`**: see Section 23 — each value encodes exchange + depth level as an atomic identity
+**`templateId`**: BOOK_LEVEL=1, ORDER_EVENT=2, TRADE_EVENT=3
+
+**`venue`**: see Section 24 — each value encodes exchange + depth level
 
 **`bookDepth`**: L1=1, L2=2, L3=3
-
-**`templateId`**: BOOK_LEVEL=1, ORDER_ENTRY=2
 
 **`side`**: BID=1, ASK=2
 
 **`action`** (BOOK_LEVEL): UPSERT=1, DELETE=2
 
-**`action`** (ORDER_ENTRY): UPSERT=1 (order added or size modified), DELETE=2 (order cancelled or fully filled)
+**`action`** (ORDER_EVENT): always UPSERT=1 — use `reason` for semantic meaning
 
-**`orderType`** (ORDER_ENTRY only): LIMIT=1, MARKET=2, STOP=3
+**`reason`** (ORDER_EVENT): RECEIVED=0, OPEN=1, TRIGGERED=2, MODIFIED=3,
+FILLED=4, CANCELLED=5, EXPIRED=6, REJECTED=7, DELETE=8
+
+**`orderType`** (ORDER_EVENT): UNKNOWN=0, LIMIT=1, MARKET=2, STOP=3
+
+---
+
+### Order ID Encoding
+
+All L3 venues encode order IDs as two `uint64` fields (`orderIdHigh` +
+`orderIdLow`). The encoding convention per venue:
+
+**Coinbase (UUID):**
+Parse the UUID hex string `"d50ec984-77a8-460a-b958-66f114b0de9b"` directly
+from `ByteBuf` without allocating a `String` or `UUID` object:
+```
+orderIdHigh = d50ec984_77a8_460a  (bytes 0–7 of the 16-byte UUID)
+orderIdLow  = b958_66f114b0de9b  (bytes 8–15 of the 16-byte UUID)
+```
+
+**Kraken (alphanumeric string, e.g. `"O6ZQNQ-BXL4E-5WGINO"`):**
+Zero-pad the ASCII bytes of the string into 16 bytes:
+```
+orderIdHigh = first 8 ASCII bytes, zero-padded
+orderIdLow  = next 8 ASCII bytes, zero-padded
+```
+
+**Binance (int64):**
+```
+orderIdHigh = 0
+orderIdLow  = the numeric order ID as uint64
+```
+
+The same convention applies to `makerOrderIdHigh/Low` and
+`takerOrderIdHigh/Low` in the TRADE_EVENT template.
+
+---
+
+### Sequence Mapping by Venue
+
+| Venue | `gatewayMessageSeq` | `seq1` | `seq2` | Notes |
+|---|---|---|---|---|
+| Coinbase L2 | `sequenceTracker().next()` | same | same | No exchange sequence in level2 |
+| Coinbase L3 (ORDER_EVENT) | `sequenceTracker().next()` | `message.sequence` | `message.sequence` | Exchange per-message sequence for gap detection |
+| Coinbase L3 (TRADE_EVENT) | `sequenceTracker().next()` | `message.sequence` | `message.sequence` | Same match message sequence |
+| Binance L2 | `sequenceTracker().next()` | `U` field | `u` field | Range per message |
+
+---
 
 ### Timestamp Rules
 
 **`exchangeTimestamp`**
-- Source: exchange-provided timestamp when present
-- Coinbase `snapshot`: use top-level `time` field if present and non-zero;
-  encode `-1` if the field is absent, empty, or epoch-zero.
-  The Exchange Direct Feed includes `time` on snapshot messages.
-  Do not use any per-level timestamp field.
-- Coinbase `l2update`: use top-level `time` field
-- Parse as UTC; convert to epoch nanoseconds; preserve available precision
-- Any absent/unknown sentinel (empty string, null, `0`, epoch-zero text) → encode as `-1`
+- Coinbase L2 `snapshot` and `l2update`: top-level `time` field
+- Coinbase L3 order lifecycle messages: top-level `time` field
+- Absent, empty, null, or epoch-zero → encode `-1`
 
 **`ingressTimestamp`**
-- Source: `CachedNanoClock.nanoTime()` captured when the frame enters the pipeline
-- Always populated
-- **Precision caveat:** `CachedNanoClock` is updated once per Netty event-loop
-  iteration. If multiple frames arrive in one iteration, all share the same cached
-  timestamp. This means `ingressTimestamp` has *iteration-level* granularity, not
-  true per-frame granularity. Under burst conditions this can understate latency
-  for all frames in the burst except the first.
-  Downstream consumers must treat `ingressTimestamp` as an iteration boundary
-  marker, not a precise per-frame arrival time. For true per-frame measurement,
-  call `System.nanoTime()` once at the top of `onTextFrame()` and pass the result
-  directly to `beginMessage()` — accepting the 30–100ns syscall cost per frame.
+- `CachedNanoClock.nanoTime()` — iteration-level granularity
+- Multiple frames in one Netty iteration share the same cached value
+- Downstream consumers treat it as an iteration boundary marker
+
+**`orderTimestamp`** (ORDER_EVENT only)
+- Per-order exchange timestamp for venues that provide it (Kraken L3)
+- Coinbase L3: always `-1` (not provided)
+
+---
 
 ### Capacity Limits and Overflow Policy
 
-- Messages exceeding 10,000 levels: **reject** — do not allocate a larger buffer
-- Messages exceeding the encode buffer capacity: **reject**
-- Rejection must: increment overflow counters, emit structured rate-limited logging,
+- Messages exceeding 10,000 entries: reject without allocating a larger buffer
+- Rejection: increment overflow counters, emit rate-limited structured log,
   trigger recovery when appropriate
+
+---
 
 ### BOOK_RESET Encoding
 
-`BOOK_RESET` is a zero-entry SBE message. It uses the same header + body layout
-as any other message, with `entryCount = 0` and no repeating group bytes.
+`BOOK_RESET` is a zero-entry control message using the same header + body
+layout as any other message, with `entryCount = 0` and no repeating group.
 
 ```
 Header (8 bytes):
-  magic         = 0xEB0B              — protocol marker (little-endian: 0B EB)
-  version       = 1                   — current schema version
+  magic         = 0xEB0B
+  version       = 2
   templateId    = templateIdByte passed to publishReset()
-  blockLength   = 47                  — body length (same constant for all templates)
-  entryCount    = 0                   — written directly by the publisher reset encoder
+  blockLength   = 51
+  entryCount    = 0
 
-Body (47 bytes):
-  eventType     = BOOK_RESET (1)
-  venue         = venueByte passed to publishReset()
-  bookDepth     = bookDepthByte passed to publishReset()
-  instrumentId  = this connector's instrumentId
-  gatewayMessageSeq = 0          — BOOK_RESET does not consume a sequence number
-  seq1          = 0
-  seq2          = 0
-  exchangeTimestamp = -1         — no exchange event associated
+Body (51 bytes):
+  eventType         = BOOK_RESET (1)
+  venue             = venueByte passed to publishReset()
+  bookDepth         = bookDepthByte passed to publishReset()
+  instrumentId      = this connector's instrumentId
+  gatewayMessageSeq = 0   (reset does not consume a sequence number)
+  seq1              = 0
+  seq2              = 0
+  exchangeTimestamp = -1
   ingressTimestamp  = nanoClock.nanoTime() passed to publishReset()
+  checksum          = 0
 
 Repeating group: (empty — 0 bytes)
 ```
 
-Total size: 8 + 47 = 55 bytes.
+**Total BOOK_RESET size: 8 + 51 = 59 bytes.**
 
-`publishReset()` is encoded directly by the `Publisher` implementation as a
-zero-entry `BOOK_RESET` control message using the passed `venueByte`,
-`bookDepthByte`, `templateIdByte`, and `NanoClock` to write the header/body fields and stamp
-`ingressTimestamp`. It does not use the connector's reusable `SbeEncoder`
-buffer and does not participate in `publisher_latency_*`.
-`gatewayMessageSeq` is set to 0 rather than `sequenceTracker().next()` because
-a reset marks the end of a session — sequence numbers restart from 1 with the
-next `BOOK_SNAPSHOT` after recovery completes.
-
-### Consumers
-
-- Use `blockLength` from the header to locate the repeating group — do not hard-code offsets
-- Epoch-zero exchange timestamp (`0` nanoseconds) encodes as `-1`
+`publishReset()` encodes directly into a dedicated 59-byte scratch buffer
+allocated once at `Publisher` construction time. It never uses the connector's
+reusable `SbeEncoder` buffer.
 
 ---
 
-## 18. Low-Latency Implementation Guidelines
+### Consumers
+
+- Read `templateId` from header before parsing repeating group entries
+- Read `blockLength` (= 51) to locate repeating group — do not hard-code offset 59
+- Read `entryCount` before iterating repeating group entries
+- Epoch-zero exchange timestamp encodes as `-1`
+- `checksum = 0` means the venue does not provide a CRC; do not validate
+
+---
+
+## 19. Low-Latency Implementation Guidelines
 
 The following guidelines apply to every class in the hot-path pipeline.
 Violations are bugs, not style issues. Each guideline states the rule,
@@ -4149,7 +5189,7 @@ kernel network stack.
 
 ---
 
-## 19. Staff-Level Recommendations
+## 20. Staff-Level Recommendations
 
 ### Netty
 
@@ -4259,7 +5299,7 @@ kernel network stack.
 
 ---
 
-## 20. Publisher Model
+## 21. Publisher Model
 
 ### Contract
 
@@ -4490,6 +5530,44 @@ transport requires it.
 ### Downstream Recovery Signaling
 
 External downstream systems may request recovery via explicit request messages.
+This is a downstream-to-gateway control-plane path. Downstream systems must not
+send `BOOK_RESET` back to the gateway; `BOOK_RESET` remains a gateway-to-downstream
+market-data/control event emitted only after the gateway accepts a recovery request.
+
+If the downstream integration boundary already uses SBE-style binary framing,
+downstream-triggered recovery must use a distinct SBE control message such as
+`RECOVERY_REQUEST` or `RECOVERY_REQUEST_BATCH`. The gateway-side receiver decodes
+that control message into one or more `RecoveryRequest` objects and delegates to
+the same routing path used by internal recovery:
+
+```text
+Downstream detects invalid/stale/corrupt local book
+    -> sends RECOVERY_REQUEST or RECOVERY_REQUEST_BATCH to gateway
+    -> gateway receiver decodes SBE control message
+    -> GatewayRuntime.requestRecovery(RecoveryRequest)
+    -> RecoveryRequestRouter routes by venue + instrumentId
+    -> Connector.requestRecovery(...)
+    -> Connector publishes BOOK_RESET downstream
+    -> Connector executes venue recovery and waits for fresh snapshot
+```
+
+The receiver is intentionally off the market-data hot path. It may allocate
+`RecoveryRequest` and result objects because recovery signaling is exceptional
+control-plane work, not per-frame normalization.
+
+The downstream recovery control-plane uses dedicated SBE-style codecs:
+
+- `SbeRecoveryRequestEncoder` writes downstream-to-gateway
+  `RECOVERY_REQUEST` and `RECOVERY_REQUEST_BATCH` control messages. This encoder
+  is for downstream adapters, integration tests, and any future control-plane
+  transport. It must not reuse the market-data `SbeEncoder`, because
+  `BOOK_RESET`, `BOOK_SNAPSHOT`, and `BOOK_UPDATE` are gateway-to-downstream
+  book events, not request messages sent back to the gateway.
+- `SbeRecoveryRequestDecoder` validates and decodes those control messages at
+  the gateway boundary before any `RecoveryRequest` object is constructed.
+- Both codecs use little-endian fixed-width fields and must validate the
+  protocol marker, version, control template id, and payload length before the
+  receiver invokes gateway recovery.
 
 **Minimum request fields:**
 
@@ -4500,6 +5578,12 @@ External downstream systems may request recovery via explicit request messages.
 | `requestType` | `RecoveryRequestType` | What kind of recovery is being requested. |
 | `reasonCode` | `RecoveryReasonCode` | Why recovery is being requested. |
 | `requestTimestamp` | `long` | Epoch nanoseconds when the request was generated. |
+
+For a batch request, the SBE control message should carry the common fields
+(`venue`, `requestType`, `reasonCode`, `requestTimestamp`) once and use a
+repeating group of `instrumentId` values. The receiver expands the batch into
+one connector-scoped `RecoveryRequest` per instrument so existing per-instrument
+routing, coalescing, and metrics remain unchanged.
 
 ```java
 // core/recovery/RecoveryRequest.java
@@ -4548,7 +5632,7 @@ Recovery signaling must be decoupled from market-data buffers.
 
 ---
 
-## 21. Recovery Model
+## 22. Recovery Model
 
 ### 21.1 Recovery Semantics
 
@@ -4574,7 +5658,7 @@ Downstream recovery requests are matched at the gateway boundary as follows:
    log once (rate-limited) and ignore.
 4. **Route**: schedule recovery execution on the matching connector's event-loop thread.
 
-`RecoveryRequest.venue` is a required field (see Section 20, Downstream Recovery
+`RecoveryRequest.venue` is a required field (see Section 22, Downstream Recovery
 Signaling). A request without a valid venue cannot satisfy the venue check and
 must not be acted upon.
 
@@ -4690,7 +5774,7 @@ can be attached later without changing the hot-path core.
 
 ---
 
-## 22. How to Add a New Venue Strategy
+## 23. How to Add a New Venue Strategy
 
 A **venue strategy** is the combination of an exchange and a data level —
 for example `COINBASE_L2`, `COINBASE_L3`, or `BINANCE_L2`. Each is a fully
@@ -4742,7 +5826,7 @@ exchange-specific logic: `FeedParser`, `SnapshotStrategy`, and `SubscriptionBuil
 
 9. **Assign `VenueEnum.XLN`** — add the constant with the next available byte
    value, correct `BookDepth`, and correct `TemplateId`. Immutable once assigned
-   — see Section 23.
+   — see Section 24.
 
 10. **Register in ServiceLoader** — add one line:
     `io.rueishi.marketdata.crypto.venue.<exchange>.l<n>.XLnConnectorFactory`
@@ -4849,7 +5933,7 @@ are required beyond adding the `VenueEnum` constant.
 
 ---
 
-## 23. Venue Enum Allocation
+## 24. Venue Enum Allocation
 
 The `venue` field in the SBE binary is a `uint8`. Each value encodes
 **exchange + data level** as a single atomic identity — there is no separate
@@ -4915,7 +5999,7 @@ connector and parser never reference these values directly.
 
 ---
 
-## 24. Test Strategy
+## 25. Test Strategy
 
 ### Test Categories
 
@@ -4940,7 +6024,9 @@ connector and parser never reference these values directly.
    recovery; heartbeat timeout; pre-snapshot update drops; session boundary behavior
 
 7. **Downstream Recovery Tests** — downstream-triggered reset/resnapshot; resync
-   flow; duplicate request coalescing; venue mismatch ignored
+   flow; duplicate request coalescing; venue mismatch ignored; dedicated
+   `RECOVERY_REQUEST` and `RECOVERY_REQUEST_BATCH` SBE encoder/decoder
+   round-trip; malformed recovery control messages rejected before routing
 
 8. **Publisher and Backpressure Tests** — bounded retry behavior; drop on
    backpressure; backpressure triggers recovery; event-loop thread does not block
@@ -5193,7 +6279,7 @@ must use bounded waits for every asynchronous expectation.
 `SbeDecoder` is a test-only class in `src/test/java/.../core/encoding/SbeDecoder.java`.
 It is not a production class and must never be imported by any non-test source.
 
-It reads the binary layout defined in Section 17 and exposes decoded fields as
+It reads the binary layout defined in Section 18 and exposes decoded fields as
 Java primitives for test assertions:
 
 ```java
@@ -5274,7 +6360,7 @@ assertThat(decoded.priceScale(0)).isEqualTo(2);
 
 ---
 
-## 25. Acceptance Criteria
+## 26. Acceptance Criteria
 
 The gateway is complete when all of the following are demonstrably met through
 automated tests. Each criterion is binary pass/fail.
@@ -5382,6 +6468,33 @@ automated tests. Each criterion is binary pass/fail.
 
 - **AC-25**: Recovery initiated by publisher backpressure follows the same path.
 
+### Downstream Recovery Control-Plane
+
+- **AC-69**: A well-formed downstream-to-gateway `RECOVERY_REQUEST` SBE control
+  message is decoded into exactly one `RecoveryRequest` with the expected
+  `venue`, `instrumentId`, `requestType`, `reasonCode`, `requestTimestamp`, and
+  optional diagnostic text. Verified by `SbeRecoveryRequestEncoder` /
+  `SbeRecoveryRequestDecoder` round-trip tests and by confirming the receiver
+  delegates the decoded request to `GatewayRuntime.requestRecovery(...)`.
+
+- **AC-70**: A well-formed `RECOVERY_REQUEST_BATCH` SBE control message carries
+  common `venue`, `requestType`, `reasonCode`, and `requestTimestamp` fields once
+  and a repeating group of `instrumentId` values. The receiver expands the batch
+  into one `RecoveryRequest` per instrument and routes each independently,
+  returning a per-batch result that reports accepted and rejected instruments.
+
+- **AC-71**: Malformed recovery control messages are rejected before routing.
+  Invalid magic, unsupported version, unknown control template id, truncated
+  payload, invalid enum values, empty batch, or inconsistent repeating-group
+  length must not call `GatewayRuntime.requestRecovery(...)` and must not publish
+  `BOOK_RESET`.
+
+- **AC-72**: Downstream recovery control-plane SBE codecs are distinct from the
+  market-data `SbeEncoder` and decoder helpers. Downstream must send
+  `RECOVERY_REQUEST` / `RECOVERY_REQUEST_BATCH`, never `BOOK_RESET`, back to the
+  gateway. `BOOK_RESET` remains a gateway-to-downstream message emitted only
+  after recovery is accepted by the gateway.
+
 ### Context Lifecycle
 
 - **AC-26**: No venue implementation (`FeedParser`, `SnapshotStrategy`,
@@ -5467,7 +6580,7 @@ automated tests. Each criterion is binary pass/fail.
   `SbeDecoder.entryCount() == 0`.
 
 - **AC-36a**: `ByteBufScanner.parseDecimal()` produces the correct (mantissa, scale) pair
-  for all test vectors listed in Section 24 without calling `Double.parseDouble` or any
+  for all test vectors listed in Section 25 without calling `Double.parseDouble` or any
   floating-point operation. Verified by unit tests covering standard, leading-zero,
   trailing-zero, integer, negative, large-value, and overflow cases. Large-value test
   uses a price string that would round if parsed as a `double` and confirms the integer
@@ -5535,8 +6648,8 @@ automated tests. Each criterion is binary pass/fail.
 
 ### Wire Format
 
-- **AC-53**: Encoded messages are little-endian with the exact byte layout from Section 16.
-  Body is 47 bytes (includes the `bookDepth` field).
+- **AC-53**: Encoded messages are little-endian with the exact byte layout from Section 18.
+  Body is 51 bytes (includes `bookDepth` and `checksum` fields). Schema version = 2.
 
 - **AC-54**: The decoder uses `blockLength` from the header to locate the repeating
   group — not hard-coded offsets.
@@ -5562,7 +6675,7 @@ automated tests. Each criterion is binary pass/fail.
 
 - **AC-60**: A `BOOK_LEVEL` encoded message uses `writeLevel()` entries of 20 bytes
   each. An `ORDER_ENTRY` encoded message uses `writeOrder()` entries of 29 bytes
-  each. The total encoded size matches the formula from Section 16 for the configured
+  each. The total encoded size matches the formula from Section 18 for the configured
   template.
 
 ### Project Structure
@@ -5594,7 +6707,7 @@ automated tests. Each criterion is binary pass/fail.
 
 ---
 
-## 26. Implementation Roadmap
+## 27. Implementation Roadmap
 
 The system is built in four phases. Each phase delivers a runnable, testable
 milestone. Do not proceed to the next phase until all acceptance criteria
@@ -5699,6 +6812,8 @@ Deliverables:
 - Self-triggered recovery: sequence gaps, stream-integrity failure, heartbeat timeout
 - Control-plane recovery on invalid `subscriptions` acknowledgement
 - Downstream recovery request handling: venue + instrumentId routing, coalescing
+- Downstream-to-gateway SBE recovery control messages:
+  `RECOVERY_REQUEST` and `RECOVERY_REQUEST_BATCH`
 - Backpressure-triggered recovery
 - Graceful shutdown on `SIGTERM` with `shutdownDeadlineMs` enforcement
 - Publisher-stage and ingress-to-handoff latency counters
@@ -5718,28 +6833,420 @@ Deliverables:
 - AC-33b, AC-36b, AC-36c, AC-37, AC-39, AC-40, AC-40a: Allocation, latency, and observability
 - AC-42, AC-43, AC-46, AC-47: Metrics REST endpoint, discovery, persistence validation, and error logging
 - AC-49 through AC-51: Graceful shutdown, heartbeat recovery, reconnect backoff
+- AC-69 through AC-72: Downstream-to-gateway SBE recovery request codec,
+  receiver, batch routing, and malformed-message rejection
 
 ---
 
-### Phase 4 — Second Venue Strategy
+### Phase 4 — COINBASE_L3 and Schema v2
 
-**Goal:** Prove extensibility by adding `COINBASE_L3` as the second venue
-strategy with zero changes to `core/`. This validates that base classes
-eliminate boilerplate, ServiceLoader wiring works end-to-end for a new venue
-strategy, and the `ORDER_ENTRY` SBE template is supported alongside
-`COINBASE_L2`.
+**Goal:** Implement `COINBASE_L3` as the second venue strategy and deliver the
+revised SBE schema (version 2) required to support L3 semantics across all
+target exchanges. Phase 4 has two parallel tracks: **Track A** upgrades the
+core encoding infrastructure; **Track B** builds the L3 venue package.
+Both tracks must complete before the phase gate passes.
 
-**Phase 4 acceptance criteria:**
-- All Phase 1–3 criteria continue to pass for `COINBASE_L2`
-- `COINBASE_L3` passes fixture-driven parser and integration tests
-- AC-36d: L3 `BOOK_RESET` preserves venue template semantics
-- AC-57 through AC-60: correct `bookDepth`, `templateId`, and entry sizes for the `ORDER_ENTRY` template
-- AC-62: `venue/coinbase/l3/` sub-package is complete
-- No `core/` class was modified to add the new venue (verified by diff)
+**Phase 4 is the only phase that requires `core/` changes.** The changes are
+additive and precisely bounded: `SbeEncoder` gains `writeTrade()` and updated
+body constants; `EncodingConstants` gains schema v2 constants. No other `core/`
+class is modified.
 
 ---
 
-## 27. Final Notes
+#### Phase 4 — Track A: Schema v2 Core Infrastructure
+
+**Feature 4A.1 — `EncodingConstants` schema v2 update**
+
+**What to build:** Update all encoding constants for schema version 2.
+
+**Files to modify:**
+```
+core/encoding/EncodingConstants.java
+src/test/java/.../core/encoding/SbeEncoderBookLevelTest.java    ← update for new body size
+src/test/java/.../core/encoding/SbeEncoderOrderEntryTest.java   ← update for ORDER_EVENT
+src/test/java/.../core/encoding/SbeDecoderBlockLengthTest.java  ← update blockLength=51
+```
+
+**Key changes:**
+```java
+// Version
+public static final int VERSION = 2;               // was 1
+
+// Body
+public static final int BODY_BLOCK_LENGTH = 51;    // was 47 — added checksum uint32
+public static final int CHECKSUM_OFFSET = 55;      // new — uint32 at offset 55
+
+// Repeating group start
+public static final int REPEATING_GROUP_OFFSET = 59; // was 55 (8 header + 51 body)
+
+// BOOK_RESET total size
+public static final int BOOK_RESET_SIZE = 59;      // was 55
+
+// Template IDs
+public static final byte TEMPLATE_ID_BOOK_LEVEL   = 1;  // unchanged
+public static final byte TEMPLATE_ID_ORDER_EVENT  = 2;  // replaces ORDER_ENTRY
+public static final byte TEMPLATE_ID_TRADE_EVENT  = 3;  // new
+
+// Event types
+public static final byte EVENT_TYPE_BOOK_RESET    = 1;  // unchanged
+public static final byte EVENT_TYPE_BOOK_SNAPSHOT = 2;  // unchanged
+public static final byte EVENT_TYPE_BOOK_UPDATE   = 3;  // unchanged
+public static final byte EVENT_TYPE_BOOK_TRADE    = 4;  // new
+
+// ORDER_EVENT entry (51 bytes) — offsets within entry
+public static final int ORDER_EVENT_ORDER_ID_HIGH_OFFSET  = 0;
+public static final int ORDER_EVENT_ORDER_ID_LOW_OFFSET   = 8;
+public static final int ORDER_EVENT_SIDE_OFFSET           = 16;
+public static final int ORDER_EVENT_ACTION_OFFSET         = 17;
+public static final int ORDER_EVENT_REASON_OFFSET         = 18;
+public static final int ORDER_EVENT_ORDER_TYPE_OFFSET     = 19;
+public static final int ORDER_EVENT_PRICE_SCALE_OFFSET    = 20;
+public static final int ORDER_EVENT_QTY_SCALE_OFFSET      = 21;
+public static final int ORDER_EVENT_OLD_QTY_SCALE_OFFSET  = 22;
+public static final int ORDER_EVENT_TIMESTAMP_OFFSET      = 23;
+public static final int ORDER_EVENT_PRICE_MANTISSA_OFFSET = 31;
+public static final int ORDER_EVENT_QTY_MANTISSA_OFFSET   = 39;
+public static final int ORDER_EVENT_OLD_QTY_MANTISSA_OFFSET = 47;
+public static final int ORDER_EVENT_ENTRY_LENGTH          = 51;
+
+// TRADE_EVENT entry (51 bytes) — offsets within entry
+public static final int TRADE_EVENT_MAKER_ID_HIGH_OFFSET  = 0;
+public static final int TRADE_EVENT_MAKER_ID_LOW_OFFSET   = 8;
+public static final int TRADE_EVENT_TAKER_ID_HIGH_OFFSET  = 16;
+public static final int TRADE_EVENT_TAKER_ID_LOW_OFFSET   = 24;
+public static final int TRADE_EVENT_SIDE_OFFSET           = 32;
+public static final int TRADE_EVENT_PRICE_SCALE_OFFSET    = 33;
+public static final int TRADE_EVENT_QTY_SCALE_OFFSET      = 34;
+public static final int TRADE_EVENT_PRICE_MANTISSA_OFFSET = 35;
+public static final int TRADE_EVENT_QTY_MANTISSA_OFFSET   = 43;
+public static final int TRADE_EVENT_ENTRY_LENGTH          = 51;
+
+// Reason codes (ORDER_EVENT)
+public static final byte REASON_RECEIVED     = 0;
+public static final byte REASON_OPEN         = 1;
+public static final byte REASON_TRIGGERED    = 2;
+public static final byte REASON_MODIFIED     = 3;
+public static final byte REASON_FILLED       = 4;
+public static final byte REASON_CANCELLED    = 5;
+public static final byte REASON_EXPIRED      = 6;
+public static final byte REASON_REJECTED     = 7;
+public static final byte REASON_DELETE       = 8;
+```
+
+**Spec sections:** §18 (Binary Encoding Model — all field offsets, sizes, enum values)
+
+**ACs proven:** AC-L3-18
+
+---
+
+**Feature 4A.2 — `SbeEncoder` schema v2 additions**
+
+**What to build:** Add `writeOrder()` rename to `writeOrderEvent()`, add
+`writeTrade()` method, update body constants, add `checksum` field to
+`beginMessage()`.
+
+**Files to modify:**
+```
+core/encoding/SbeEncoder.java
+src/test/java/.../core/encoding/SbeEncoderOrderEventTest.java   ← new
+src/test/java/.../core/encoding/SbeEncoderTradeEventTest.java   ← new
+```
+
+**Key changes to `SbeEncoder`:**
+
+```java
+// Updated beginMessage — writes checksum=0 into body
+public void beginMessage(byte eventType, long gatewayMessageSeq,
+                         long seq1, long seq2,
+                         long exchangeTimestamp, long ingressTimestamp)
+// body now 51 bytes — writes checksum=0 at CHECKSUM_OFFSET
+
+// Renamed and updated — ORDER_EVENT template
+public void writeOrderEvent(long orderIdHigh, long orderIdLow,
+                            byte side, byte action, byte reason,
+                            byte orderType,
+                            byte priceScale, byte qtyScale, byte oldQtyScale,
+                            long orderTimestamp,
+                            long priceMantissa, long qtyMantissa,
+                            long oldQtyMantissa)
+// 51 bytes per entry; validates templateId == ORDER_EVENT
+
+// New — TRADE_EVENT template
+public void writeTrade(long makerOrderIdHigh, long makerOrderIdLow,
+                       long takerOrderIdHigh, long takerOrderIdLow,
+                       byte side,
+                       byte priceScale, byte qtyScale,
+                       long priceMantissa, long qtyMantissa)
+// 51 bytes per entry; validates templateId == TRADE_EVENT
+
+// Updated BOOK_RESET scratch buffer — 59 bytes (was 55)
+// InMemoryPublisher.resetEncodingBuffer must be resized to 59 bytes
+```
+
+**Test methods required** (`@Tag("unit")`):
+```
+SbeEncoderOrderEventTest:
+  writeOrderEvent_received_correctBytesAtAllOffsets
+  writeOrderEvent_open_reasonEncodedCorrectly
+  writeOrderEvent_done_filled_reasonFilledEncoded
+  writeOrderEvent_done_cancelled_reasonCancelledEncoded
+  writeOrderEvent_modified_oldQtyMantissaEncoded
+  writeOrderEvent_triggered_reasonTriggeredEncoded
+  writeOrderEvent_orderIdHighAndLowBothEncoded
+  writeOrderEvent_orderTimestampMinusOne_encodedCorrectly
+  writeOrderEvent_wrongTemplate_throws
+
+SbeEncoderTradeEventTest:
+  writeTrade_correctBytesAtAllOffsets
+  writeTrade_makerOrderIdHigh_encodedAtCorrectOffset
+  writeTrade_makerOrderIdLow_encodedAtCorrectOffset
+  writeTrade_takerOrderIdHigh_encodedAtCorrectOffset
+  writeTrade_takerOrderIdLow_encodedAtCorrectOffset
+  writeTrade_side_takerSideEncoded
+  writeTrade_entryLengthIs51Bytes
+  writeTrade_wrongTemplate_throws
+  writeTrade_alwaysExactlyOneEntry
+
+SbeDecoderBlockLengthTest:
+  decoder_usesBlockLength51_toLocateRepeatingGroup
+  decoder_version2_acceptedByDecoder
+  decoder_bookReset_totalSizeIs59Bytes
+  decoder_checksum_readableAtOffset55
+```
+
+**ACs proven:** AC-L3-18 · AC-34 · AC-35 · AC-53 · AC-54
+
+---
+
+**Feature 4A.3 — `InMemoryPublisher` BOOK_RESET buffer resize**
+
+**What to build:** Resize the dedicated scratch buffer in `InMemoryPublisher`
+(and `LoggingPublisher`) from 55 to 59 bytes.
+
+**Files to modify:**
+```
+core/publisher/InMemoryPublisher.java
+core/publisher/LoggingPublisher.java
+src/test/java/.../core/publisher/InMemoryPublisherTest.java
+```
+
+**Key change:**
+```java
+// was: new UnsafeBuffer(new byte[EncodingConstants.BOOK_RESET_SIZE_V1])
+// now: new UnsafeBuffer(new byte[EncodingConstants.BOOK_RESET_SIZE])  // = 59
+```
+
+**Test method required:**
+```
+publishReset_encodesCorrect59ByteBookReset
+publishReset_blockLength_is51
+publishReset_checksumField_isZero
+```
+
+**ACs proven:** AC-L3-18 · AC-36c
+
+---
+
+#### Phase 4 — Track B: COINBASE_L3 Venue Package
+
+**Feature 4B.1 — `CoinbaseL3FeedParser`**
+
+**What to build:** The L3 parser — the most complex class in Track B.
+
+**Inputs:** Features 4A.1–4A.3 complete. Feature 2.2 (`CoinbaseAuthenticator`,
+`CoinbaseConfig`) complete.
+
+**Files to create:**
+```
+venue/coinbase/l3/CoinbaseL3FeedParser.java
+src/test/resources/venue/coinbase/l3/received.json
+src/test/resources/venue/coinbase/l3/received_market_order.json
+src/test/resources/venue/coinbase/l3/open.json
+src/test/resources/venue/coinbase/l3/done_filled.json
+src/test/resources/venue/coinbase/l3/done_cancelled.json
+src/test/resources/venue/coinbase/l3/activate.json
+src/test/resources/venue/coinbase/l3/match.json
+src/test/resources/venue/coinbase/l3/change.json
+src/test/resources/venue/coinbase/l3/heartbeat.json
+src/test/resources/venue/coinbase/l3/subscriptions_ack.json
+src/test/resources/venue/coinbase/l3/subscriptions_ack_missing_full.json
+src/test/resources/venue/coinbase/l3/subscriptions_ack_wrong_product.json
+src/test/resources/venue/coinbase/l3/error_message.json
+src/test/resources/venue/coinbase/l3/unknown_type.json
+src/test/resources/venue/coinbase/l3/malformed.json
+src/test/resources/venue/coinbase/l3/bad_decimal.json
+src/test/java/.../venue/coinbase/l3/CoinbaseL3FeedParserTest.java
+```
+
+**Key contracts:**
+- Stateless — no session state as fields
+- `received` → `SbeEncoder.writeOrderEvent()` with reason=RECEIVED=0
+- `open` → `writeOrderEvent()` with reason=OPEN=1
+- `done` → `writeOrderEvent()` with reason mapped from Coinbase `reason` field
+- `activate` → `writeOrderEvent()` with reason=TRIGGERED=2
+- `change` → `writeOrderEvent()` with reason=MODIFIED=3, `oldQtyMantissa` from `old_size`
+- `match` → `SbeEncoder.writeTrade()`, eventType=BOOK_TRADE=4, single entry
+- UUID parsing: call `ByteBufScanner.parseUuidHighLow(buf, result)` — no String/UUID allocation
+- All `seq1 = seq2 = message.sequence` from JSON (not gateway counter)
+- `heartbeat` → update `lastHeartbeatReceivedNanos`, no SBE publish
+- `subscriptions` ack → validate `full` + `heartbeat` channels, seed liveness
+- `error` → increment `authenticationErrors`, trigger recovery
+
+**Spec sections:** §15.5 (all encoding rules), §15.8 (parsing notes), §18 (schema v2)
+
+**Test methods required** (`@Tag("unit")`): All methods listed in §15.11
+`CoinbaseL3FeedParserTest` (positive, negative, failure cases)
+
+**ACs proven:** AC-L3-1 through AC-L3-10 · AC-L3-17 · AC-L3-19
+
+---
+
+**Feature 4B.2 — `ByteBufScanner.parseUuidHighLow()`**
+
+**What to build:** Add a no-allocation UUID hex parser to `ByteBufScanner`.
+
+**Files to modify:**
+```
+core/parser/ByteBufScanner.java
+src/test/java/.../core/parser/ByteBufScannerTest.java
+```
+
+**Key contract:**
+```java
+// Parses "d50ec984-77a8-460a-b958-66f114b0de9b" from ByteBuf into result[0]=high, result[1]=low
+// Never allocates String or UUID
+// Advances reader index past closing quote (if quoted) or to first non-hex char
+public static void parseUuidHighLow(ByteBuf buf, long[] result)
+```
+
+**Test methods required** (`@Tag("unit")`):
+```
+parseUuidHighLow_validUuid_correctHighAndLow
+parseUuidHighLow_quotedUuid_skipsQuotes
+parseUuidHighLow_doesNotAllocate
+parseUuidHighLow_highBytesMatchFirst8BytesOfUuid
+parseUuidHighLow_lowBytesMatchLast8BytesOfUuid
+parseUuidHighLow_malformedUuid_returnsSentinel
+```
+
+**ACs proven:** AC-L3-9 · AC-L3-17
+
+---
+
+**Feature 4B.3 — `CoinbaseL3SnapshotStrategy` (REST_THEN_DELTA)**
+
+**What to build:** The REST snapshot fetch, delta buffer, and alignment logic.
+
+**Inputs:** Features 4A.1–4A.3, 4B.1 complete.
+
+**Files to create:**
+```
+venue/coinbase/l3/CoinbaseL3SnapshotStrategy.java
+src/test/resources/venue/coinbase/l3/snapshot_rest.json
+src/test/resources/venue/coinbase/l3/recovery_snapshot_rest.json
+src/test/resources/venue/coinbase/l3/recovery_open.json
+src/test/java/.../venue/coinbase/l3/CoinbaseL3SnapshotStrategyTest.java
+```
+
+**Key contracts:**
+- `mode()` → `REST_THEN_DELTA`
+- `triggerSnapshot()`: allocate pre-sized delta ring buffer → start async
+  `java.net.http.HttpClient` REST fetch on non-hot-path thread → schedule
+  result processing back to connector event loop
+- REST response parsed from JSON: each `[price, size, order_id]` entry encoded
+  as ORDER_EVENT with `reason=OPEN=1`, `seq1=seq2=REST sequence value`
+- Delta alignment per Section 5.5 algorithm
+- Ring buffer overflow → trigger stream integrity failure + recovery
+
+**Spec sections:** §5.5 (REST_THEN_DELTA algorithm), §15.6 (REST snapshot encoding)
+
+**Test methods required** (`@Tag("unit")`): All methods listed in §15.11
+`CoinbaseL3SnapshotStrategyTest`
+
+**ACs proven:** AC-L3-11 · AC-L3-12 · AC-L3-13
+
+---
+
+**Feature 4B.4 — `CoinbaseL3SubscriptionBuilder`, `CoinbaseL3RecoveryStrategy`,
+`CoinbaseL3Connector`, `CoinbaseL3ConnectorFactory`**
+
+**What to build:** Four structural wiring classes.
+
+**Inputs:** Features 4B.1–4B.3 complete.
+
+**Files to create:**
+```
+venue/coinbase/l3/CoinbaseL3SubscriptionBuilder.java
+venue/coinbase/l3/CoinbaseL3RecoveryStrategy.java
+venue/coinbase/l3/CoinbaseL3Connector.java
+venue/coinbase/l3/CoinbaseL3ConnectorFactory.java
+src/test/java/.../venue/coinbase/l3/CoinbaseL3SubscriptionBuilderTest.java
+src/test/java/.../venue/coinbase/l3/CoinbaseL3RecoveryStrategyTest.java
+src/test/java/.../venue/coinbase/l3/CoinbaseL3ConnectorIntegrationTest.java
+```
+
+Update `META-INF/services/...ConnectorFactory` — add `CoinbaseL3ConnectorFactory` line.
+
+**Key contracts:**
+- `CoinbaseL3SubscriptionBuilder.buildSubscribe()` → `channels: ["full", "heartbeat"]`
+- `CoinbaseL3Connector`: `venueEnum()` → `COINBASE_L3`, `maxEntryCount()` → 10_000,
+  `headroomBytes()` → 8_192
+- `CoinbaseL3RecoveryStrategy` extends `ReconnectRecoveryStrategy` —
+  `doResubscribe()` sends authenticated subscribe for `full` + `heartbeat`
+- `CoinbaseL3ConnectorFactory extends AbstractConnectorFactory` — wires all
+  L3 components; creates `TRADE_EVENT` scratch buffer for `publishReset()`
+
+**Spec sections:** §15.2 (auth), §15.3 (subscribe schema), §22 (how to add venue)
+
+**Test methods required** (`@Tag("unit")` and `@Tag("integration")`): All
+methods listed in §15.11 `CoinbaseL3SubscriptionBuilderTest`,
+`CoinbaseL3RecoveryStrategyTest`, `CoinbaseL3ConnectorIntegrationTest`
+
+**ACs proven:** AC-L3-1 · AC-L3-13 · AC-L3-14 · AC-L3-16 · AC-L3-20
+
+---
+
+**Feature 4B.5 — `CoinbaseL3EndToEndTest`**
+
+**What to build:** Full end-to-end test suite using `CoinbaseExchangeSimulator`
+extended with L3 send methods, plus a mock REST server for the snapshot endpoint.
+
+**Inputs:** Features 4B.1–4B.4 complete.
+
+**Files to create:**
+```
+src/test/java/.../venue/coinbase/l3/CoinbaseL3EndToEndTest.java
+```
+
+**Mock REST server:** Use an embedded HTTP server (e.g. `com.sun.net.httpserver.HttpServer`)
+returning a pre-built `snapshot_rest.json` response. Configure the
+`CoinbaseL3SnapshotStrategy` REST endpoint URL to point to the mock.
+
+**Test methods required** (`@Tag("e2e")`): All scenarios listed in §15.11
+`CoinbaseL3EndToEndTest` — happy path, pre-snapshot drops, recovery scenarios,
+protocol violations, structural validation.
+
+**ACs proven:** All AC-L3-1 through AC-L3-21
+
+---
+
+#### Phase 4 Gate
+
+Phase 4 is complete when:
+1. All Track A features (4A.1–4A.3) done — `SbeEncoderOrderEventTest` and
+   `SbeEncoderTradeEventTest` fully green
+2. All Track B features (4B.1–4B.5) done — all L3 test classes fully green
+3. All 21 AC-L3 criteria pass
+4. All Phase 1–3 criteria continue to pass for `COINBASE_L2`
+5. `git diff --name-only HEAD` modified `core/` files are exactly:
+   `core/encoding/EncodingConstants.java`, `core/encoding/SbeEncoder.java`,
+   `core/parser/ByteBufScanner.java`, `core/publisher/InMemoryPublisher.java`,
+   `core/publisher/LoggingPublisher.java` — and no others
+
+---
+
+
+## 28. Final Notes
 
 This system is designed to be:
 

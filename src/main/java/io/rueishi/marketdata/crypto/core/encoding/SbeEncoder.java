@@ -16,8 +16,9 @@ import org.agrona.concurrent.UnsafeBuffer;
  * resolved the configured instrument, venue, book depth, and {@link TemplateId}.
  * Venue parsers drive it in the event-loop flow by calling
  * {@link #beginMessage(byte, long, long, long, long, long)}, then
- * {@link #writeLevel(byte, byte, long, byte, long, byte)} or
- * {@link #writeOrder(long, byte, byte, byte, long, byte, long, byte)}, then
+ * {@link #writeLevel(byte, byte, long, byte, long, byte)},
+ * {@link #writeOrderEvent(long, long, byte, byte, byte, byte, byte, byte, byte, long, long, long, long)}, or
+ * {@link #writeTrade(long, long, long, long, byte, byte, byte, long, long)}, then
  * {@link #endMessage(Publisher, InstrumentCounters, NanoClock)}. Parser
  * contexts that own retry and recovery policy use {@link #finishMessage()} and
  * publish the returned byte region themselves.</p>
@@ -70,9 +71,9 @@ public final class SbeEncoder {
         this.bookDepthByte = bookDepthByte;
         this.templateIdByte = templateIdByte;
         this.maxEntryCount = maxEntryCount;
-        this.entryLength = EncodingConstants.entryLength(templateIdByte);
+        this.entryLength = entryLength(templateIdByte);
         this.buffer = new UnsafeBuffer(ByteBuffer.allocateDirect(
-                EncodingConstants.requiredCapacity(templateIdByte, maxEntryCount, headroomBytes)));
+                requiredCapacity(templateIdByte, maxEntryCount, headroomBytes)));
     }
 
     /**
@@ -125,9 +126,10 @@ public final class SbeEncoder {
         buffer.putLong(EncodingConstants.SEQ2_OFFSET, seq2, EncodingConstants.BYTE_ORDER);
         buffer.putLong(
                 EncodingConstants.EXCHANGE_TIMESTAMP_OFFSET,
-                exchangeTimestamp == 0 ? -1L : exchangeTimestamp,
+                exchangeTimestamp == 0 ? EncodingConstants.NO_TIMESTAMP : exchangeTimestamp,
                 EncodingConstants.BYTE_ORDER);
         buffer.putLong(EncodingConstants.INGRESS_TIMESTAMP_OFFSET, ingressTimestamp, EncodingConstants.BYTE_ORDER);
+        buffer.putInt(EncodingConstants.BODY_CHECKSUM_OFFSET, EncodingConstants.NO_CHECKSUM, EncodingConstants.BYTE_ORDER);
     }
 
     /**
@@ -135,7 +137,7 @@ public final class SbeEncoder {
      *
      * <p>The method writes the 20-byte entry at the current repeating-group
      * position and advances the internal cursor. It fails if the encoder was
-     * constructed for the ORDER_ENTRY template or if the configured entry limit
+     * constructed for another template or if the configured entry limit
      * would be exceeded.</p>
      *
      * @param side side byte, such as BID=1 or ASK=2
@@ -165,14 +167,136 @@ public final class SbeEncoder {
     }
 
     /**
-     * Writes one individual order entry for a {@link TemplateId#ORDER_ENTRY} message.
+     * Writes one schema v2 individual order event entry.
      *
-     * <p>The method writes the 29-byte entry at the current repeating-group
-     * position and advances the internal cursor. It fails if the encoder was
-     * constructed for the BOOK_LEVEL template or if the configured entry limit
-     * would be exceeded.</p>
+     * <p>The method writes the 55-byte {@code ORDER_EVENT} entry at the current repeating-group position and advances
+     * the internal cursor. It fails if the encoder was constructed for a different template, no message is in progress,
+     * or the configured entry limit would be exceeded. Venue L3 parsers call this for order lifecycle messages such as
+     * received, open, done, activate, and change.</p>
      *
-     * @param orderId exchange-assigned stable order identifier
+     * @param orderIdHigh high 64 bits of the parsed venue order id
+     * @param orderIdLow low 64 bits of the parsed venue order id
+     * @param side side byte, such as BID=1 or ASK=2
+     * @param action action byte, such as UPSERT=1 or DELETE=2
+     * @param reason normalized order event reason byte
+     * @param orderType order type byte, such as LIMIT=1
+     * @param priceScale decimal scale for {@code priceMantissa}
+     * @param qtyScale decimal scale for {@code qtyMantissa}
+     * @param oldQtyScale decimal scale for {@code oldQtyMantissa}
+     * @param orderTimestamp order event timestamp, or {@link EncodingConstants#NO_TIMESTAMP} when absent
+     * @param priceMantissa signed price mantissa
+     * @param qtyMantissa signed remaining quantity mantissa
+     * @param oldQtyMantissa signed previous quantity mantissa for modify events, or zero when absent
+     * @throws IllegalStateException if no message is in progress or the template is not ORDER_EVENT
+     * @throws IllegalArgumentException if the configured entry limit would be exceeded
+     */
+    public void writeOrderEvent(
+            long orderIdHigh,
+            long orderIdLow,
+            byte side,
+            byte action,
+            byte reason,
+            byte orderType,
+            byte priceScale,
+            byte qtyScale,
+            byte oldQtyScale,
+            long orderTimestamp,
+            long priceMantissa,
+            long qtyMantissa,
+            long oldQtyMantissa) {
+        requireInProgress();
+        checkTemplate(EncodingConstants.TEMPLATE_ID_ORDER_EVENT);
+        requireEntryCapacity();
+
+        int offset = position;
+        buffer.putLong(offset + EncodingConstants.ORDER_EVENT_ORDER_ID_HIGH_OFFSET, orderIdHigh, EncodingConstants.BYTE_ORDER);
+        buffer.putLong(offset + EncodingConstants.ORDER_EVENT_ORDER_ID_LOW_OFFSET, orderIdLow, EncodingConstants.BYTE_ORDER);
+        buffer.putByte(offset + EncodingConstants.ORDER_EVENT_SIDE_OFFSET, side);
+        buffer.putByte(offset + EncodingConstants.ORDER_EVENT_ACTION_OFFSET, action);
+        buffer.putByte(offset + EncodingConstants.ORDER_EVENT_REASON_OFFSET, reason);
+        buffer.putByte(offset + EncodingConstants.ORDER_EVENT_ORDER_TYPE_OFFSET, orderType);
+        buffer.putByte(offset + EncodingConstants.ORDER_EVENT_PRICE_SCALE_OFFSET, priceScale);
+        buffer.putByte(offset + EncodingConstants.ORDER_EVENT_QTY_SCALE_OFFSET, qtyScale);
+        buffer.putByte(offset + EncodingConstants.ORDER_EVENT_OLD_QTY_SCALE_OFFSET, oldQtyScale);
+        buffer.putLong(offset + EncodingConstants.ORDER_EVENT_ORDER_TS_OFFSET, orderTimestamp, EncodingConstants.BYTE_ORDER);
+        buffer.putLong(offset + EncodingConstants.ORDER_EVENT_PRICE_MANTISSA_OFFSET, priceMantissa, EncodingConstants.BYTE_ORDER);
+        buffer.putLong(offset + EncodingConstants.ORDER_EVENT_QTY_MANTISSA_OFFSET, qtyMantissa, EncodingConstants.BYTE_ORDER);
+        buffer.putLong(
+                offset + EncodingConstants.ORDER_EVENT_OLD_QTY_MANTISSA_OFFSET,
+                oldQtyMantissa,
+                EncodingConstants.BYTE_ORDER);
+        advanceEntry();
+    }
+
+    /**
+     * Writes one schema v2 trade event entry.
+     *
+     * <p>The method writes the 51-byte {@code TRADE_EVENT} entry at the first repeating-group slot and advances the
+     * internal cursor exactly once. Trade-event messages represent a single match, so a second call within the same
+     * message is rejected even when the encoder was constructed with a larger maximum entry count.</p>
+     *
+     * @param makerOrderIdHigh high 64 bits of the parsed maker order id
+     * @param makerOrderIdLow low 64 bits of the parsed maker order id
+     * @param takerOrderIdHigh high 64 bits of the parsed taker order id
+     * @param takerOrderIdLow low 64 bits of the parsed taker order id
+     * @param side normalized taker side byte
+     * @param priceScale decimal scale for {@code priceMantissa}
+     * @param qtyScale decimal scale for {@code qtyMantissa}
+     * @param priceMantissa signed trade price mantissa
+     * @param qtyMantissa signed trade quantity mantissa
+     * @throws IllegalStateException if no message is in progress, the template is not TRADE_EVENT, or a trade entry was already written
+     * @throws IllegalArgumentException if the configured entry limit would be exceeded
+     */
+    public void writeTrade(
+            long makerOrderIdHigh,
+            long makerOrderIdLow,
+            long takerOrderIdHigh,
+            long takerOrderIdLow,
+            byte side,
+            byte priceScale,
+            byte qtyScale,
+            long priceMantissa,
+            long qtyMantissa) {
+        requireInProgress();
+        checkTemplate(EncodingConstants.TEMPLATE_ID_TRADE_EVENT);
+        if (entryCount != 0) {
+            throw new IllegalStateException("TRADE_EVENT messages must contain exactly one trade entry");
+        }
+        requireEntryCapacity();
+
+        int offset = position;
+        buffer.putLong(
+                offset + EncodingConstants.TRADE_EVENT_MAKER_ID_HIGH_OFFSET,
+                makerOrderIdHigh,
+                EncodingConstants.BYTE_ORDER);
+        buffer.putLong(
+                offset + EncodingConstants.TRADE_EVENT_MAKER_ID_LOW_OFFSET,
+                makerOrderIdLow,
+                EncodingConstants.BYTE_ORDER);
+        buffer.putLong(
+                offset + EncodingConstants.TRADE_EVENT_TAKER_ID_HIGH_OFFSET,
+                takerOrderIdHigh,
+                EncodingConstants.BYTE_ORDER);
+        buffer.putLong(
+                offset + EncodingConstants.TRADE_EVENT_TAKER_ID_LOW_OFFSET,
+                takerOrderIdLow,
+                EncodingConstants.BYTE_ORDER);
+        buffer.putByte(offset + EncodingConstants.TRADE_EVENT_SIDE_OFFSET, side);
+        buffer.putByte(offset + EncodingConstants.TRADE_EVENT_PRICE_SCALE_OFFSET, priceScale);
+        buffer.putByte(offset + EncodingConstants.TRADE_EVENT_QTY_SCALE_OFFSET, qtyScale);
+        buffer.putLong(offset + EncodingConstants.TRADE_EVENT_PRICE_MANTISSA_OFFSET, priceMantissa, EncodingConstants.BYTE_ORDER);
+        buffer.putLong(offset + EncodingConstants.TRADE_EVENT_QTY_MANTISSA_OFFSET, qtyMantissa, EncodingConstants.BYTE_ORDER);
+        advanceEntry();
+    }
+
+    /**
+     * Compatibility shim for pre-schema-v2 callers that still use the old order-entry method name.
+     *
+     * <p>The shim maps the single long order id into the low half of the schema v2 UUID-style order id and encodes
+     * absent fields with neutral values. New L3 parser code should call {@link #writeOrderEvent(long, long, byte, byte,
+     * byte, byte, byte, byte, byte, long, long, long, long)} so reason, timestamp, and old quantity are explicit.</p>
+     *
+     * @param orderId exchange-assigned stable order identifier from pre-v2 callers
      * @param side side byte, such as BID=1 or ASK=2
      * @param action action byte, such as UPSERT=1 or DELETE=2
      * @param orderType order type byte, such as LIMIT=1
@@ -180,9 +304,11 @@ public final class SbeEncoder {
      * @param priceScale decimal scale for {@code priceMantissa}
      * @param qtyMantissa signed remaining quantity mantissa
      * @param qtyScale decimal scale for {@code qtyMantissa}
-     * @throws IllegalStateException if no message is in progress or the template is not ORDER_ENTRY
+     * @throws IllegalStateException if no message is in progress or the template is not ORDER_EVENT
      * @throws IllegalArgumentException if the configured entry limit would be exceeded
+     * @deprecated use {@link #writeOrderEvent(long, long, byte, byte, byte, byte, byte, byte, byte, long, long, long, long)}
      */
+    @Deprecated(since = "schema-v2", forRemoval = true)
     public void writeOrder(
             long orderId,
             byte side,
@@ -192,22 +318,20 @@ public final class SbeEncoder {
             byte priceScale,
             long qtyMantissa,
             byte qtyScale) {
-        requireInProgress();
-        if (templateIdByte != TemplateId.ORDER_ENTRY.byteValue()) {
-            throw new IllegalStateException("writeOrder requires ORDER_ENTRY template");
-        }
-        requireEntryCapacity();
-
-        int offset = position;
-        buffer.putLong(offset, orderId, EncodingConstants.BYTE_ORDER);
-        buffer.putByte(offset + 8, side);
-        buffer.putByte(offset + 9, action);
-        buffer.putByte(offset + 10, orderType);
-        buffer.putByte(offset + 11, priceScale);
-        buffer.putByte(offset + 12, qtyScale);
-        buffer.putLong(offset + 13, priceMantissa, EncodingConstants.BYTE_ORDER);
-        buffer.putLong(offset + 21, qtyMantissa, EncodingConstants.BYTE_ORDER);
-        advanceEntry();
+        writeOrderEvent(
+                0L,
+                orderId,
+                side,
+                action,
+                EncodingConstants.REASON_OPEN,
+                orderType,
+                priceScale,
+                qtyScale,
+                (byte) 0,
+                EncodingConstants.NO_TIMESTAMP,
+                priceMantissa,
+                qtyMantissa,
+                0L);
     }
 
     /**
@@ -279,6 +403,15 @@ public final class SbeEncoder {
     }
 
     /**
+     * Returns the template id byte configured for this encoder.
+     *
+     * @return template id byte used in every message header written by this encoder
+     */
+    public byte templateIdByte() {
+        return templateIdByte;
+    }
+
+    /**
      * Exposes the encoder-owned buffer for low-level tests.
      *
      * <p>Production callers should not depend on this accessor for message
@@ -312,8 +445,61 @@ public final class SbeEncoder {
         }
     }
 
+    /**
+     * Verifies that a template-specific writer is being used with a matching encoder template.
+     *
+     * @param expected expected template id byte for the writer method being executed
+     * @throws IllegalStateException if this encoder was constructed for another template
+     */
+    private void checkTemplate(byte expected) {
+        if (templateIdByte != expected) {
+            throw new IllegalStateException(
+                    "Template mismatch: encoder=" + Byte.toUnsignedInt(templateIdByte)
+                            + ", expected=" + Byte.toUnsignedInt(expected));
+        }
+    }
+
     private void advanceEntry() {
         entryCount++;
         position += entryLength;
+    }
+
+    /**
+     * Resolves the schema v2 repeating-group entry length for one template id.
+     *
+     * @param templateIdByte template id byte configured for this encoder
+     * @return entry length in bytes for the selected schema v2 template
+     * @throws IllegalArgumentException if the template id is not recognized
+     */
+    private static int entryLength(byte templateIdByte) {
+        return switch (templateIdByte) {
+            case EncodingConstants.TEMPLATE_ID_BOOK_LEVEL -> EncodingConstants.BOOK_LEVEL_ENTRY_LENGTH;
+            case EncodingConstants.TEMPLATE_ID_ORDER_EVENT -> EncodingConstants.ORDER_EVENT_ENTRY_LENGTH;
+            case EncodingConstants.TEMPLATE_ID_TRADE_EVENT -> EncodingConstants.TRADE_EVENT_ENTRY_LENGTH;
+            default -> throw new IllegalArgumentException("Unknown templateIdByte: " + Byte.toUnsignedInt(templateIdByte));
+        };
+    }
+
+    /**
+     * Computes the direct encode-buffer capacity required by this encoder configuration.
+     *
+     * @param templateIdByte template id byte configured for this encoder
+     * @param maxEntryCount maximum repeating-group entries per message
+     * @param headroomBytes additional caller-requested capacity beyond the maximum encoded size
+     * @return required direct buffer capacity in bytes
+     * @throws IllegalArgumentException if the template, entry count, or headroom is invalid
+     * @throws ArithmeticException if the capacity calculation overflows
+     */
+    private static int requiredCapacity(byte templateIdByte, int maxEntryCount, int headroomBytes) {
+        if (maxEntryCount <= 0 || maxEntryCount > EncodingConstants.MAX_SUPPORTED_ENTRIES) {
+            throw new IllegalArgumentException(
+                    "maxEntryCount must be between 1 and " + EncodingConstants.MAX_SUPPORTED_ENTRIES);
+        }
+        if (headroomBytes < 0) {
+            throw new IllegalArgumentException("headroomBytes must not be negative");
+        }
+        return EncodingConstants.MESSAGE_PREFIX_LENGTH
+                + Math.multiplyExact(maxEntryCount, entryLength(templateIdByte))
+                + headroomBytes;
     }
 }

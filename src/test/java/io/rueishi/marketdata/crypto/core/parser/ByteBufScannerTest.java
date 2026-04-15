@@ -18,6 +18,9 @@ import org.junit.jupiter.api.Test;
  * helpers used by venue-specific parser code.</p>
  */
 class ByteBufScannerTest {
+    private static final String SAMPLE_UUID = "d50ec984-77a8-460a-b958-66f114b0de9b";
+    private static final long SAMPLE_UUID_HIGH = 0xd50ec98477a8460aL;
+    private static final long SAMPLE_UUID_LOW = 0xb95866f114b0de9bL;
 
     /**
      * Verifies all decimal vectors required by the Phase 1 specification.
@@ -116,6 +119,111 @@ class ByteBufScannerTest {
         assertThat(ByteBufScanner.nextArrayElement(buf)).isTrue();
         assertThat(ByteBufScanner.readLong(buf)).isEqualTo(3L);
         assertThat(ByteBufScanner.nextArrayElement(buf)).isFalse();
+    }
+
+    /**
+     * Verifies the UUID parser writes the schema v2 high 64-bit half for a valid Coinbase order id.
+     */
+    @Test
+    void parseUuidHighLow_validUuid_correctHighValue() {
+        long[] result = new long[2];
+
+        boolean parsed = ByteBufScanner.parseUuidHighLow(direct(SAMPLE_UUID), result);
+
+        assertThat(parsed).isTrue();
+        assertThat(result[0]).isEqualTo(SAMPLE_UUID_HIGH);
+    }
+
+    /**
+     * Verifies the UUID parser writes the schema v2 low 64-bit half for a valid Coinbase order id.
+     */
+    @Test
+    void parseUuidHighLow_validUuid_correctLowValue() {
+        long[] result = new long[2];
+
+        boolean parsed = ByteBufScanner.parseUuidHighLow(direct(SAMPLE_UUID), result);
+
+        assertThat(parsed).isTrue();
+        assertThat(result[1]).isEqualTo(SAMPLE_UUID_LOW);
+    }
+
+    /**
+     * Verifies quoted UUID values consume both quotes so callers land on the following delimiter.
+     */
+    @Test
+    void parseUuidHighLow_quotedUuid_skipsOpeningAndClosingQuote() {
+        ByteBuf buf = direct("\"" + SAMPLE_UUID + "\",");
+        long[] result = new long[2];
+
+        boolean parsed = ByteBufScanner.parseUuidHighLow(buf, result);
+
+        assertThat(parsed).isTrue();
+        assertThat(result).containsExactly(SAMPLE_UUID_HIGH, SAMPLE_UUID_LOW);
+        assertThat(buf.getByte(buf.readerIndex())).isEqualTo((byte) ',');
+    }
+
+    /**
+     * Verifies the parsed high half matches the first eight bytes of the textual UUID.
+     */
+    @Test
+    void parseUuidHighLow_highBytesMatchFirst8BytesOfUuid() {
+        long[] result = new long[2];
+
+        ByteBufScanner.parseUuidHighLow(direct(SAMPLE_UUID), result);
+
+        assertThat(result[0]).isEqualTo(0xd5_0e_c9_84_77_a8_46_0aL);
+    }
+
+    /**
+     * Verifies the parsed low half matches the final eight bytes of the textual UUID.
+     */
+    @Test
+    void parseUuidHighLow_lowBytesMatchLast8BytesOfUuid() {
+        long[] result = new long[2];
+
+        ByteBufScanner.parseUuidHighLow(direct(SAMPLE_UUID), result);
+
+        assertThat(result[1]).isEqualTo(0xb9_58_66_f1_14_b0_de_9bL);
+    }
+
+    /**
+     * Verifies malformed non-hex content is rejected without exceptions and overwrites prior scratch values.
+     */
+    @Test
+    void parseUuidHighLow_malformedUuid_writesSentinelAndReturnsFalse() {
+        long[] result = {7L, 9L};
+
+        boolean parsed = ByteBufScanner.parseUuidHighLow(direct("\"not-a-uuid-!!!!\""), result);
+
+        assertThat(parsed).isFalse();
+        assertThat(result).containsExactly(0L, 0L);
+    }
+
+    /**
+     * Verifies truncated UUID content is rejected so L3 parsers cannot encode partial order ids.
+     */
+    @Test
+    void parseUuidHighLow_truncatedUuid_writesSentinelAndReturnsFalse() {
+        long[] result = {5L, 6L};
+
+        boolean parsed = ByteBufScanner.parseUuidHighLow(direct("\"d50ec984-77a8-460a-b958\""), result);
+
+        assertThat(parsed).isFalse();
+        assertThat(result).containsExactly(0L, 0L);
+    }
+
+    /**
+     * Verifies the reader index advances to the first byte after an unquoted UUID token.
+     */
+    @Test
+    void parseUuidHighLow_readerIndexAdvancedPastUuid() {
+        ByteBuf buf = direct(SAMPLE_UUID + "}");
+        long[] result = new long[2];
+
+        boolean parsed = ByteBufScanner.parseUuidHighLow(buf, result);
+
+        assertThat(parsed).isTrue();
+        assertThat(buf.getByte(buf.readerIndex())).isEqualTo((byte) '}');
     }
 
     private static void assertDecimal(String text, long expectedMantissa, long expectedScale) {
