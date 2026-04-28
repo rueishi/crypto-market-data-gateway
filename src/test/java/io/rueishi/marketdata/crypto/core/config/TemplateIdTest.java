@@ -18,6 +18,7 @@ class TemplateIdTest {
     @Test
     void templateIdsCarryAssignedWireValues() {
         assertThat(TemplateId.BOOK_LEVEL.byteValue()).isEqualTo((byte) 1);
-        assertThat(TemplateId.ORDER_ENTRY.byteValue()).isEqualTo((byte) 2);
+        assertThat(TemplateId.ORDER_EVENT.byteValue()).isEqualTo((byte) 2);
+        assertThat(TemplateId.TRADE_EVENT.byteValue()).isEqualTo((byte) 3);
     }
 }

@@ -33,7 +33,7 @@ import org.junit.jupiter.api.Test;
  * deterministic test simulator.</p>
  */
 class CoinbaseL2RecoveryIntegrationTest {
-    private static final Path FIXTURE_DIR = Path.of("src/test/resources/fixtures/coinbase/l2");
+    private static final Path FIXTURE_DIR = Path.of("src/test/resources/venue/coinbase/l2");
     private static final Duration WAIT_TIMEOUT = Duration.ofSeconds(5);
 
     /**

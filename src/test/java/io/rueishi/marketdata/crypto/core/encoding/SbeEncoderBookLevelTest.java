@@ -57,6 +57,8 @@ class SbeEncoderBookLevelTest {
         assertThat(decoded.seq2()).isEqualTo(12);
         assertThat(decoded.exchangeTimestamp()).isEqualTo(123_456_789L);
         assertThat(decoded.ingressTimestamp()).isEqualTo(987_654_321L);
+        assertThat(publisher.lastMessage().length).isEqualTo(
+                EncodingConstants.REPEATING_GROUP_OFFSET + 2 * EncodingConstants.BOOK_LEVEL_ENTRY_LENGTH);
         assertThat(decoded.side(0)).isEqualTo(1);
         assertThat(decoded.action(0)).isEqualTo(1);
         assertThat(decoded.priceScale(0)).isEqualTo(2);

@@ -17,7 +17,9 @@ import io.rueishi.marketdata.crypto.core.recovery.RecoveryStrategy;
 import io.rueishi.marketdata.crypto.core.transport.WebSocketFrameHandler;
 import io.rueishi.marketdata.crypto.venue.coinbase.shared.CoinbaseAuthenticator;
 import io.rueishi.marketdata.crypto.venue.coinbase.shared.CoinbaseConfig;
+import java.time.Duration;
 import java.nio.charset.StandardCharsets;
+import java.util.function.BooleanSupplier;
 import org.agrona.concurrent.NanoClock;
 import org.junit.jupiter.api.Test;
 
@@ -71,6 +73,7 @@ class CoinbaseL2LivenessTest {
 
             clock.set(CoinbaseL2ConnectorTestSupport.DEFAULT_NANO_TIME + 10_000_000L);
             fixture.connector.detectLivenessTimeout();
+            waitUntil(() -> fixture.instrumentCounters().recoveryAttempts().get() == 1);
 
             assertThat(fixture.instrumentCounters().heartbeatsMissed().get()).isEqualTo(1);
             assertThat(fixture.instrumentCounters().livenessFailures().get()).isEqualTo(1);
@@ -102,6 +105,8 @@ class CoinbaseL2LivenessTest {
             fixture.connector.detectLivenessTimeout();
             clock.set(CoinbaseL2ConnectorTestSupport.DEFAULT_NANO_TIME + 20_000_000L);
             fixture.connector.detectLivenessTimeout();
+            waitUntil(() -> fixture.instrumentCounters().recoveryAttempts().get() == 1
+                    && fixture.instrumentCounters().recoveryRequestsIgnoredInProgress().get() == 1);
 
             assertThat(fixture.instrumentCounters().recoveryAttempts().get()).isEqualTo(1);
             assertThat(fixture.instrumentCounters().recoveryRequestsIgnoredInProgress().get()).isEqualTo(1);
@@ -163,6 +168,22 @@ class CoinbaseL2LivenessTest {
             eventLoopGroup.shutdownGracefully().syncUninterruptibly();
             gatewayCounters.close();
         }
+    }
+
+    private static void waitUntil(BooleanSupplier condition) {
+        long deadlineNanos = System.nanoTime() + Duration.ofSeconds(5).toNanos();
+        while (System.nanoTime() < deadlineNanos) {
+            if (condition.getAsBoolean()) {
+                return;
+            }
+            try {
+                Thread.sleep(10L);
+            } catch (InterruptedException ex) {
+                Thread.currentThread().interrupt();
+                throw new AssertionError("Interrupted while waiting for liveness recovery", ex);
+            }
+        }
+        throw new AssertionError("Timed out waiting for liveness recovery");
     }
 
     private static final class RecordingRecoveryStrategy implements RecoveryStrategy {

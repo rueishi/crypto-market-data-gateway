@@ -16,17 +16,17 @@ public enum VenueEnum {
     /** Coinbase level 2 aggregated book feed. */
     COINBASE_L2((byte) 1, BookDepth.L2, TemplateId.BOOK_LEVEL),
     /** Coinbase level 3 full order feed. */
-    COINBASE_L3((byte) 2, BookDepth.L3, TemplateId.ORDER_ENTRY),
+    COINBASE_L3((byte) 2, BookDepth.L3, TemplateId.ORDER_EVENT),
     /** Binance level 2 depth feed; value reserved before venue implementation arrives. */
     BINANCE_L2((byte) 3, BookDepth.L2, TemplateId.BOOK_LEVEL),
     /** Binance level 3 order feed; value reserved before venue implementation arrives. */
-    BINANCE_L3((byte) 4, BookDepth.L3, TemplateId.ORDER_ENTRY),
+    BINANCE_L3((byte) 4, BookDepth.L3, TemplateId.ORDER_EVENT),
     /** Kraken level 2 depth feed; value reserved before venue implementation arrives. */
     KRAKEN_L2((byte) 5, BookDepth.L2, TemplateId.BOOK_LEVEL),
     /** OKX level 2 depth feed; value reserved before venue implementation arrives. */
     OKX_L2((byte) 6, BookDepth.L2, TemplateId.BOOK_LEVEL),
     /** OKX level 3 order feed; value reserved before venue implementation arrives. */
-    OKX_L3((byte) 7, BookDepth.L3, TemplateId.ORDER_ENTRY),
+    OKX_L3((byte) 7, BookDepth.L3, TemplateId.ORDER_EVENT),
     /** Bybit level 2 depth feed; value reserved before venue implementation arrives. */
     BYBIT_L2((byte) 8, BookDepth.L2, TemplateId.BOOK_LEVEL);
 

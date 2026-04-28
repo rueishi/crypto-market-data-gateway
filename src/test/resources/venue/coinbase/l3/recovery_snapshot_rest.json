@@ -1,0 +1,9 @@
+{
+  "sequence": 638,
+  "bids": [
+    ["100.00","1.00000000","aaaaaaaa-aaaa-4aaa-aaaa-aaaaaaaaaaaa"]
+  ],
+  "asks": [
+    ["101.00","1.00000000","bbbbbbbb-bbbb-4bbb-bbbb-bbbbbbbbbbbb"]
+  ]
+}

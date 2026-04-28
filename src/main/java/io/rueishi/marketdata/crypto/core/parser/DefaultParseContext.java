@@ -36,6 +36,7 @@ public final class DefaultParseContext implements ParseContext {
     };
 
     private final SbeEncoder encoder;
+    private final SbeEncoder tradeEncoder;
     private final Publisher publisher;
     private final InstrumentCounters counters;
     private final NanoClock nanoClock;
@@ -63,6 +64,7 @@ public final class DefaultParseContext implements ParseContext {
             InstrumentCounters counters,
             NanoClock nanoClock) {
         this(
+                encoder,
                 encoder,
                 publisher,
                 counters,
@@ -96,6 +98,7 @@ public final class DefaultParseContext implements ParseContext {
             Runnable onSnapshotBoundaryAccepted) {
         this(
                 encoder,
+                encoder,
                 publisher,
                 counters,
                 nanoClock,
@@ -128,6 +131,7 @@ public final class DefaultParseContext implements ParseContext {
             Runnable onSubscriptionAckValidated,
             Runnable onSnapshotBoundaryAccepted) {
         this(
+                encoder,
                 encoder,
                 publisher,
                 counters,
@@ -163,7 +167,47 @@ public final class DefaultParseContext implements ParseContext {
             RecoveryRequestCallback recoveryRequestCallback,
             Runnable onSubscriptionAckValidated,
             Runnable onSnapshotBoundaryAccepted) {
+        this(
+                encoder,
+                encoder,
+                publisher,
+                counters,
+                nanoClock,
+                recoveryRequestCallback,
+                onSubscriptionAckValidated,
+                onSnapshotBoundaryAccepted);
+    }
+
+    /**
+     * Creates a parse context with separate stable encoders for order and trade templates.
+     *
+     * <p>Coinbase L3 and similar schema v2 venues publish both
+     * {@code ORDER_EVENT} and {@code TRADE_EVENT} messages. Those parsers use
+     * {@code encoder} for order lifecycle messages and {@code tradeEncoder} for
+     * trade messages while still sharing the same publisher, counters, clock,
+     * and session state.</p>
+     *
+     * @param encoder connector-owned primary encoder
+     * @param tradeEncoder connector-owned trade encoder
+     * @param publisher shared publisher used by encoder finalization
+     * @param counters per-instrument counters for this connector
+     * @param nanoClock connector-local nanosecond clock
+     * @param recoveryRequestCallback callback invoked when parser logic requests recovery
+     * @param onSubscriptionAckValidated callback invoked once the parser validates the session subscription ack
+     * @param onSnapshotBoundaryAccepted callback invoked once after a parser accepts the session snapshot
+     * @throws NullPointerException if any argument is null
+     */
+    public DefaultParseContext(
+            SbeEncoder encoder,
+            SbeEncoder tradeEncoder,
+            Publisher publisher,
+            InstrumentCounters counters,
+            NanoClock nanoClock,
+            RecoveryRequestCallback recoveryRequestCallback,
+            Runnable onSubscriptionAckValidated,
+            Runnable onSnapshotBoundaryAccepted) {
         this.encoder = Objects.requireNonNull(encoder, "encoder");
+        this.tradeEncoder = Objects.requireNonNull(tradeEncoder, "tradeEncoder");
         this.publisher = Objects.requireNonNull(publisher, "publisher");
         this.counters = Objects.requireNonNull(counters, "counters");
         this.nanoClock = Objects.requireNonNull(nanoClock, "nanoClock");
@@ -333,6 +377,19 @@ public final class DefaultParseContext implements ParseContext {
     @Override
     public SbeEncoder encoder() {
         return encoder;
+    }
+
+    /**
+     * Returns the connector-owned trade encoder installed for this parse context.
+     *
+     * <p>Contexts that do not need a second template simply return the same
+     * encoder instance as {@link #encoder()}.</p>
+     *
+     * @return stable trade encoder reference
+     */
+    @Override
+    public SbeEncoder tradeEncoder() {
+        return tradeEncoder;
     }
 
     @Override

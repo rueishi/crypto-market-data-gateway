@@ -95,7 +95,6 @@ public final class CoinbaseL2FeedParser implements FeedParser {
     public void onTextFrame(ByteBuf frame, ParseContext ctx) {
         Objects.requireNonNull(frame, "frame");
         Objects.requireNonNull(ctx, "ctx");
-        System.out.println(frame.toString(StandardCharsets.UTF_8));
         ctx.counters().framesReceived().increment();
         add(ctx.counters().bytesReceived(), frame.readableBytes());
         ctx.counters().lastMessageReceivedNanos().set(ctx.nanoClock().nanoTime());

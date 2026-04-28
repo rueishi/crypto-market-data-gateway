@@ -74,7 +74,7 @@ class CoinbaseL2PackageCompletenessTest {
                         .map(String::trim)
                         .filter(line -> !line.isEmpty())
                         .filter(line -> !line.startsWith("#")))
-                .containsExactly(CoinbaseL2ConnectorFactory.class.getName());
+                .contains(CoinbaseL2ConnectorFactory.class.getName());
 
         ConnectorFactory factory = new VenueRegistry().forVenue(VenueEnum.COINBASE_L2);
 

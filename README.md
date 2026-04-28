@@ -2,7 +2,7 @@
 
 A Java 21 market data gateway for low-latency ingestion, normalization, and downstream publishing of crypto exchange feeds. Each process instance is configured for a single venue and maintains one isolated WebSocket connection per instrument, giving each stream clear ownership of parsing, sequencing, recovery, and metrics. 
 
-The current version shiped with Coinbase Exchange L2 over WebSocket: it validates subscriptions, parses subscribe-driven book snapshots and l2update deltas, encodes normalized book events as compact SBE-style binary messages, and publishes them through a configurable downstream publisher. Downstream systems can also send SBE-style recovery control messages to request recovery for a single instrument or a batch of instruments.
+The current version ships with Coinbase Exchange L2 and Coinbase Exchange Direct L3 over WebSocket. The L2 path validates subscriptions, parses subscribe-driven book snapshots and `l2update` deltas, encodes normalized price-level events as compact SBE-style binary messages, and publishes them through a configurable downstream publisher. The L3 path supports the authenticated Coinbase Exchange Direct full-order feed, including REST-then-delta snapshot recovery, order lifecycle messages, and trade events. Downstream systems can also send SBE-style recovery control messages to request recovery for a single instrument or a batch of instruments.
 
 The project is intentionally small and explicit: Netty for transport, Agrona for counters and direct buffers, handwritten JSON scanning for venue frames, handwritten SBE-style binary encoding for downstream output and recovery control input, a plugin-in style **ServiceLoader-backed venue registry**, and deterministic tests around the parser, connector lifecycle, recovery, observability, and publisher contracts.
 
@@ -15,14 +15,16 @@ Do one thing, and do that one thing perfectly: move one configured venue's marke
 Implemented:
 
 - Coinbase Exchange L2 connector for `level2` and `heartbeat` channels.
+- Coinbase Exchange Direct L3 connector for the authenticated `full` and `heartbeat` channels.
 - Platform core contracts for venue plugins: connector factory, connector lifecycle, feed parser, subscription builder, snapshot strategy, and recovery strategy.
 - Configurable venue selection via `venue: <VENUE_ENUM>` in YAML.
 - One-venue-per-instance runtime topology by design; run multiple gateway processes for multiple venues.
 - One WebSocket connection per configured instrument for failure isolation, sequence isolation, and single-writer hot-path ownership.
 - Coinbase WebSocket authentication with Base64-decoded API secret and HMAC-SHA256 over `timestamp + "GET" + "/users/self/verify"`.
 - Subscribe-driven snapshot gating: updates are ignored until the first valid snapshot opens the stream.
-- Handwritten SBE-style `BOOK_LEVEL` encoder for L2 price levels.
-- Recovery scaffolding for reconnect, resubscribe, reset publication, snapshot-boundary completion, and downstream-triggered recovery requests.
+- REST-then-delta snapshot alignment for Coinbase Exchange Direct L3.
+- Handwritten SBE-style encoding for L2 `BOOK_LEVEL`, L3 `ORDER_EVENT`, and L3 `TRADE_EVENT` payloads.
+- Connector-owned recovery execution with reconnect, resubscribe, reset publication, snapshot-boundary completion, autonomous venue-triggered recovery, and downstream-triggered recovery requests.
 - Dedicated downstream-to-gateway SBE recovery control codecs for single-instrument `RECOVERY_REQUEST` and multi-instrument `RECOVERY_REQUEST_BATCH`.
 - Agrona-backed mapped counters and distinct error log.
 - Prometheus-format `/metrics` endpoint.
@@ -36,8 +38,6 @@ Intentionally left open:
 
 Next venue and depth work:
 
-- Implement Level 3 order-book support.
-- Add Coinbase Exchange L3 channel support as a configured venue/depth.
 - Add Binance as a new venue plugin.
 - Add Kraken as a new venue plugin.
 
@@ -45,19 +45,19 @@ Next venue and depth work:
 ![architecture](https://github.com/user-attachments/assets/fbc294b1-b5a2-460b-bfc4-80c996176463)
 
 ```text
-Coinbase WebSocket
+Coinbase WebSocket / Coinbase Exchange Direct WebSocket
         |
         v
 NettyWebSocketTransport
         |
         v
-CoinbaseL2Connector
+CoinbaseL2Connector or CoinbaseL3Connector
         |
         v
-CoinbaseL2FeedParser
+CoinbaseL2FeedParser or CoinbaseL3FeedParser
         |
         v
-SbeEncoder -> Publisher
+SbeEncoder / trade encoder -> Publisher
         |
         +--> InMemoryPublisher
         +--> LoggingPublisher -> Log4j 2 AsyncLoggerContext -> rolling file
@@ -75,6 +75,7 @@ Observability:
   GatewayCounters / InstrumentCounters -> Agrona CountersManager
   MetricsEndpoint -> GET /metrics
   GatewayErrorLog -> mapped distinct error log
+  Recovery execution -> connector-owned single-thread recovery path
 ```
 
 The hot path avoids a normalized object model. Parser code scans inbound JSON frames and writes directly into the reusable encoder buffer. The publisher contract controls ownership at the handoff boundary: a publisher must consume or copy the buffer region before returning, because the encoder reuses the buffer for the next message.
@@ -115,10 +116,10 @@ Each instrument gets its own connector lifecycle, WebSocket connection, event-lo
 
 ```text
 config/
-  coinbase-l2-direct.yaml        Runtime config for Coinbase L2
+  coinbase-l2-direct.yaml        Runtime config example for Coinbase L2
 
 scripts/
-  run-coinbase-l2-direct.ps1     Windows helper for the Coinbase L2 runtime
+  run-coinbase-l2-direct.ps1     Windows helper for the Coinbase L2 runtime example
 
 src/main/java/io/rueishi/marketdata/crypto/
   core/
@@ -137,10 +138,11 @@ src/main/java/io/rueishi/marketdata/crypto/
   venue/coinbase/
     shared/                      Coinbase auth and typed venue config
     l2/                          Coinbase L2 connector, parser, subscription builder, recovery
+    l3/                          Coinbase Exchange Direct L3 connector, parser, snapshot, subscription builder, recovery
 
 src/test/
   java/                          Unit and integration tests
-  resources/fixtures/            Coinbase L2 JSON fixtures
+  resources/venue/coinbase/      Coinbase L2 and L3 JSON fixtures
 ```
 
 ## Requirements
@@ -182,7 +184,7 @@ macOS/Linux:
 
 Gradle writes to `build-gradle/` so it stays separate from Maven's `target/` output. Both `build-gradle/` and `target/` are ignored by Git.
 
-## Running Coinbase L2
+## Running Coinbase
 
 The runtime entrypoint is `io.rueishi.marketdata.crypto.core.bootstrap.GatewayBootstrap`. It expects all runtime configuration in a YAML file supplied by:
 
@@ -190,7 +192,7 @@ The runtime entrypoint is `io.rueishi.marketdata.crypto.core.bootstrap.GatewayBo
 -Dgateway.config=<path>
 ```
 
-On Windows, the helper script builds the runtime classpath with Maven and starts the gateway:
+On Windows, the helper script builds the runtime classpath with Maven and starts the L2 example runtime:
 
 ```powershell
 $env:COINBASE_EXCHANGE_API_KEY = "<exchange-api-key>"
@@ -206,7 +208,7 @@ Use a different YAML file on Windows:
 .\scripts\run-coinbase-l2-direct.ps1 -ConfigPath config\coinbase-l2-direct.yaml
 ```
 
-On Linux/macOS, the Bash helper does the same startup path:
+On Linux/macOS, the Bash helper does the same startup path for the L2 example:
 
 ```bash
 export COINBASE_EXCHANGE_API_KEY="<exchange-api-key>"
@@ -228,11 +230,11 @@ Use a different YAML file on Linux/macOS:
 ./scripts/run-coinbase-l2-direct.sh --config config/coinbase-l2-direct.yaml
 ```
 
-The scripts validate that the three Coinbase environment variables exist, build `target/classes` plus a dependency classpath, and launch `GatewayBootstrap`.
+The scripts validate that the three Coinbase environment variables exist, build `target/classes` plus a dependency classpath, and launch `GatewayBootstrap`. They are currently L2 example launchers. Coinbase Exchange Direct L3 runs through the same bootstrap path, but you must supply an L3 YAML config with `venue: COINBASE_L3` and Coinbase channels compatible with the authenticated full-order feed.
 
 ### Coinbase Credentials
 
-The Coinbase L2 config uses placeholders:
+The Coinbase venue configs use placeholders like:
 
 ```yaml
 coinbase:
@@ -241,13 +243,13 @@ coinbase:
   passphrase: ${COINBASE_EXCHANGE_API_PASSPHRASE}
 ```
 
-Use Coinbase Exchange API credentials for this path. Do not use Advanced Trade, CDP, Prime, or other Coinbase API key families unless they are explicitly compatible with the Exchange WebSocket auth scheme. The Exchange secret is expected to be Base64-decodable.
+Use Coinbase Exchange API credentials for these paths. Do not use Advanced Trade, CDP, Prime, or other Coinbase API key families unless they are explicitly compatible with the Exchange WebSocket auth scheme. The Exchange secret is expected to be Base64-decodable. Coinbase Exchange Direct L3 uses the same Coinbase Exchange credential family but targets the authenticated full-order feed.
 
 Secrets are resolved at startup and must not be committed into YAML, logs, metrics labels, or exception messages.
 
 ### Endpoint Selection
 
-The sample config currently points at Coinbase's sandbox Direct Feed:
+The checked-in L2 example config currently points at Coinbase's sandbox Direct Feed:
 
 ```yaml
 coinbase:
@@ -265,7 +267,7 @@ If you are validating access or diagnosing auth, be careful not to mix sandbox c
 
 ## Configuration
 
-The default config lives at [config/coinbase-l2-direct.yaml](config/coinbase-l2-direct.yaml).
+The checked-in example config lives at [config/coinbase-l2-direct.yaml](config/coinbase-l2-direct.yaml). It is an L2 example config for the Coinbase Direct WebSocket.
 
 Important sections:
 
@@ -299,7 +301,14 @@ publisher:
     rollSizeMb: 256
 ```
 
-`venue` selects the exchange/depth plugin for this process. The runtime initializes connectors only for that venue; one process should not mix venues.
+`venue` selects the exchange/depth plugin for this process, such as `COINBASE_L2` or `COINBASE_L3`. The runtime initializes connectors only for that venue; one process should not mix venues.
+
+For Coinbase Exchange Direct L3, the same `coinbase:` config block is used, but the venue-specific subscription set must match the L3 connector. In practice that means:
+
+- `venue: COINBASE_L3`
+- Direct Feed endpoint under `coinbase.endpoint`
+- authenticated Coinbase Exchange credentials
+- `coinbase.channels` including `full` and `heartbeat`
 
 `instrumentId` is the stable internal numeric id encoded into downstream binary messages. Add products for the configured venue by adding `instruments` entries with unique ids. Each configured instrument creates a distinct connector and WebSocket connection.
 
@@ -363,7 +372,7 @@ Market-data header:
 |---|---:|---:|---|
 | `magic` | 0 | 2 | `0xEB0B` |
 | `version` | 2 | 1 | current version `1` |
-| `templateId` | 3 | 1 | `BOOK_LEVEL=1`, `ORDER_ENTRY=2` |
+| `templateId` | 3 | 1 | `BOOK_LEVEL=1`, `ORDER_EVENT=2`, `TRADE_EVENT=3` |
 | `blockLength` | 4 | 2 | fixed body length |
 | `entryCount` | 6 | 2 | repeating-group entry count |
 
@@ -371,8 +380,8 @@ Market-data body:
 
 | Field | Offset | Notes |
 |---|---:|---|
-| `eventType` | 8 | `BOOK_RESET=1`, `BOOK_SNAPSHOT=2`, `BOOK_UPDATE=3` |
-| `venue` | 9 | `COINBASE_L2=1` in the current implementation |
+| `eventType` | 8 | `BOOK_RESET=1`, `BOOK_SNAPSHOT=2`, `BOOK_UPDATE=3`, `BOOK_TRADE=4` |
+| `venue` | 9 | `COINBASE_L2=1`, `COINBASE_L3=2` in the current implementation |
 | `bookDepth` | 10 | encoded venue depth |
 | `instrumentId` | 11 | internal id from YAML |
 | `gatewayMessageSeq` | 15 | gateway sequence |
@@ -393,11 +402,15 @@ Repeating groups start at offset `55`.
 - price scale
 - quantity scale
 
+`ORDER_EVENT` entries are 55 bytes each and encode L3 order lifecycle data such as order id, side, action, reason, order type, timestamp, price, quantity, and old quantity.
+
+`TRADE_EVENT` entries are 51 bytes each and encode L3 trade data such as maker/taker order ids, taker side, price, and quantity.
+
 See [EncodingConstants.java](src/main/java/io/rueishi/marketdata/crypto/core/encoding/EncodingConstants.java) and [SbeEncoder.java](src/main/java/io/rueishi/marketdata/crypto/core/encoding/SbeEncoder.java) for the exact offsets and validation rules.
 
 ### Recovery Control Messages
 
-Downstream-triggered recovery uses separate control-plane templates. Downstream sends these messages to the gateway; it does not send `BOOK_RESET` back to the gateway. `BOOK_RESET` remains a gateway-to-downstream market-data event that is published only after recovery is accepted.
+Downstream-triggered recovery uses separate control-plane templates. Downstream sends these messages to the gateway; it does not send `BOOK_RESET` back to the gateway. `BOOK_RESET` remains a gateway-to-downstream market-data event that is published only after recovery is accepted. Recovery work is serialized per connector on a connector-owned recovery path so reconnect or handshake operations do not block Netty transport callbacks.
 
 Recovery control header:
 
@@ -413,7 +426,7 @@ Recovery control header:
 
 | Field | Relative Offset | Size | Notes |
 |---|---:|---:|---|
-| `venue` | 0 | 1 | target venue byte, such as `COINBASE_L2=1` |
+| `venue` | 0 | 1 | target venue byte, such as `COINBASE_L2=1` or `COINBASE_L3=2` |
 | `requestType` | 1 | 1 | `RESET=1`, `RESNAPSHOT=2`, `RESYNC=3` |
 | `reasonCode` | 2 | 1 | recovery reason code |
 | `reserved` | 3 | 1 | currently `0` |
@@ -461,7 +474,7 @@ Message trace:
 
 ## Recovery And Liveness
 
-Coinbase L2 is subscribe-driven:
+Coinbase L2 is subscribe-driven, while Coinbase Exchange Direct L3 uses REST-then-delta recovery for the authenticated full-order feed:
 
 1. Connect WebSocket.
 2. Send authenticated subscribe payload.
@@ -469,7 +482,7 @@ Coinbase L2 is subscribe-driven:
 4. Ignore order-book updates until a valid snapshot arrives.
 5. Open the update gate after the snapshot boundary.
 6. Track heartbeat liveness through counters.
-7. On recovery, publish a reset, reconnect/resubscribe, and wait for a fresh snapshot boundary.
+7. On recovery, publish a reset, reconnect/resubscribe on the connector-owned recovery path, and wait for a fresh snapshot boundary.
 
 Recovery can be triggered internally by parser, liveness, or publisher failure paths, or externally by a downstream control message. The downstream path is:
 
@@ -520,13 +533,13 @@ Run a focused Gradle test:
 .\gradlew.bat test --tests "*LoggingPublisherTest"
 ```
 
-Run Coinbase L2:
+Run Coinbase L2 example:
 
 ```powershell
 .\scripts\run-coinbase-l2-direct.ps1
 ```
 
-Run Coinbase L2 on Linux/macOS:
+Run Coinbase L2 example on Linux/macOS:
 
 ```bash
 ./scripts/run-coinbase-l2-direct.sh
@@ -549,11 +562,9 @@ Ignored generated outputs:
 
 ## Status
 
-This is an active implementation of a platform core with a working Coinbase L2 venue plugin, production-oriented core contracts, and test-heavy development scaffolding. The current downstream adapters are intended for test capture and integration validation. Production publishing is deliberately left as an integration point for the developer's infrastructure of choice: shared memory, Aeron, Chronicle Queue, or another downstream path near the order-book engine.
+This is an active implementation of a platform core with working Coinbase L2 and Coinbase Exchange Direct L3 venue plugins, production-oriented core contracts, and test-heavy development scaffolding. The current downstream adapters are intended for test capture and integration validation. Production publishing is deliberately left as an integration point for the developer's infrastructure of choice: shared memory, Aeron, Chronicle Queue, or another downstream path near the order-book engine.
 
 Near-term roadmap:
 
-- Implement Level 3 order-book encoding and lifecycle support.
-- Add Coinbase Exchange L3 channel support.
 - Add Binance as a venue plugin.
 - Add Kraken as a venue plugin.

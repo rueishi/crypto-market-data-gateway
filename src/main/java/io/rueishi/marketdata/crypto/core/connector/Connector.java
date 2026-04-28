@@ -15,7 +15,7 @@ import io.rueishi.marketdata.crypto.core.recovery.RecoveryRequest;
  * <p>Implementations must unpack {@link ConnectorContext} during initialization
  * and must not keep the context wrapper as a field. Recovery requests are
  * routed to the connector that owns the request instrument and are executed on
- * the owning event-loop path.</p>
+ * that connector's owned recovery path.</p>
  */
 public interface Connector {
 
@@ -57,9 +57,9 @@ public interface Connector {
      *
      * <p>Downstream routers call this method instead of directly invoking
      * {@link #recover(RecoveryRequest)} so transport-backed connectors can run
-     * recovery on their dedicated event-loop thread. Simple test or placeholder
-     * connectors may rely on this default implementation, which executes
-     * recovery synchronously.</p>
+     * recovery on their managed connector-owned recovery executor rather than
+     * the caller thread. Simple test or placeholder connectors may rely on this
+     * default implementation, which executes recovery synchronously.</p>
      *
      * @param request recovery request metadata for this connector
      * @throws NullPointerException if {@code request} is null

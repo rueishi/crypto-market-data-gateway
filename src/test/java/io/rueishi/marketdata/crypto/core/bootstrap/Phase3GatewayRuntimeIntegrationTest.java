@@ -14,13 +14,16 @@ import io.rueishi.marketdata.crypto.core.connector.ConnectorContext;
 import io.rueishi.marketdata.crypto.core.connector.ConnectorFactory;
 import io.rueishi.marketdata.crypto.core.recovery.RecoveryReasonCode;
 import io.rueishi.marketdata.crypto.core.recovery.RecoveryRequest;
+import io.rueishi.marketdata.crypto.core.recovery.RecoveryRequestBatchResult;
 import io.rueishi.marketdata.crypto.core.recovery.RecoveryRequestType;
+import io.rueishi.marketdata.crypto.core.recovery.SbeRecoveryRequestEncoder;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
+import org.agrona.concurrent.UnsafeBuffer;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -36,9 +39,9 @@ import org.junit.jupiter.api.io.TempDir;
 class Phase3GatewayRuntimeIntegrationTest {
 
     /**
-     * Verifies bootstrap returns a live runtime that routes recovery before
-     * shutdown, rejects recovery after shutdown begins, stops metrics, and
-     * flushes mapped observability files.
+     * Verifies bootstrap returns a live runtime that routes direct and SBE
+     * downstream recovery requests before shutdown, rejects recovery after
+     * shutdown begins, stops metrics, and flushes mapped observability files.
      */
     @Test
     void bootstrapRuntimeRoutesRecoveryAndDrainsResourcesOnShutdown(@TempDir Path tempDir) {
@@ -51,6 +54,15 @@ class Phase3GatewayRuntimeIntegrationTest {
         assertThat(factory.connector.initCalls).hasValue(1);
         assertThat(runtime.requestRecovery(recoveryRequest(1001))).isTrue();
         assertThat(factory.connector.recoveryRequests).hasValue(1);
+        UnsafeBuffer recoveryControlBuffer = new UnsafeBuffer(new byte[128]);
+        int recoveryControlLength = new SbeRecoveryRequestEncoder().encodeRequest(
+                recoveryControlBuffer,
+                0,
+                recoveryRequest(1001));
+        RecoveryRequestBatchResult recoveryControlResult =
+                runtime.recoveryRequestReceiver().receive(recoveryControlBuffer, 0, recoveryControlLength);
+        assertThat(recoveryControlResult.acceptedRequests()).isEqualTo(1);
+        assertThat(factory.connector.recoveryRequests).hasValue(2);
 
         runtime.shutdownGracefully();
 

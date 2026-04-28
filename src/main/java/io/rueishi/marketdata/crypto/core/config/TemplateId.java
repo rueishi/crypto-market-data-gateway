@@ -5,15 +5,17 @@ package io.rueishi.marketdata.crypto.core.config;
  *
  * <p>{@code TemplateId} is carried by {@link VenueEnum} and selected once when
  * connector factory code constructs an encoder. {@link #BOOK_LEVEL} identifies
- * aggregated book-level entries, while {@link #ORDER_ENTRY} identifies L3
- * order-entry messages. The byte value is part of the wire header and is
- * immutable once assigned.</p>
+ * aggregated book-level entries, {@link #ORDER_EVENT} identifies L3 order
+ * lifecycle messages, and {@link #TRADE_EVENT} identifies L3 trade messages.
+ * The byte value is part of the wire header and is immutable once assigned.</p>
  */
 public enum TemplateId {
     /** Repeating group contains aggregated price-level entries. */
     BOOK_LEVEL((byte) 1),
-    /** Repeating group contains individual order entries. */
-    ORDER_ENTRY((byte) 2);
+    /** Repeating group contains individual L3 order lifecycle entries. */
+    ORDER_EVENT((byte) 2),
+    /** Repeating group contains individual L3 trade entries. */
+    TRADE_EVENT((byte) 3);
 
     private final byte byteValue;
 

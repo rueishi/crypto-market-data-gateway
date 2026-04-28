@@ -21,12 +21,12 @@ class VenueEnumTest {
     @Test
     void venueConstantsCarryAssignedByteDepthAndTemplateValues() {
         assertVenue(VenueEnum.COINBASE_L2, 1, BookDepth.L2, TemplateId.BOOK_LEVEL, "coinbase");
-        assertVenue(VenueEnum.COINBASE_L3, 2, BookDepth.L3, TemplateId.ORDER_ENTRY, "coinbase");
+        assertVenue(VenueEnum.COINBASE_L3, 2, BookDepth.L3, TemplateId.ORDER_EVENT, "coinbase");
         assertVenue(VenueEnum.BINANCE_L2, 3, BookDepth.L2, TemplateId.BOOK_LEVEL, "binance");
-        assertVenue(VenueEnum.BINANCE_L3, 4, BookDepth.L3, TemplateId.ORDER_ENTRY, "binance");
+        assertVenue(VenueEnum.BINANCE_L3, 4, BookDepth.L3, TemplateId.ORDER_EVENT, "binance");
         assertVenue(VenueEnum.KRAKEN_L2, 5, BookDepth.L2, TemplateId.BOOK_LEVEL, "kraken");
         assertVenue(VenueEnum.OKX_L2, 6, BookDepth.L2, TemplateId.BOOK_LEVEL, "okx");
-        assertVenue(VenueEnum.OKX_L3, 7, BookDepth.L3, TemplateId.ORDER_ENTRY, "okx");
+        assertVenue(VenueEnum.OKX_L3, 7, BookDepth.L3, TemplateId.ORDER_EVENT, "okx");
         assertVenue(VenueEnum.BYBIT_L2, 8, BookDepth.L2, TemplateId.BOOK_LEVEL, "bybit");
     }
 

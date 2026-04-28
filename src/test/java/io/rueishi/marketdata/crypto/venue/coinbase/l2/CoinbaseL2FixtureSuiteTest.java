@@ -15,7 +15,7 @@ import org.junit.jupiter.api.Test;
 /**
  * Fixture-driven verification suite for the Phase 2 Coinbase L2 parser.
  *
- * <p>The suite reads the JSON resources under {@code fixtures/coinbase/l2} and
+ * <p>The suite reads the JSON resources under {@code venue/coinbase/l2} and
  * drives the production {@link CoinbaseL2FeedParser} through
  * {@link CoinbaseL2ParserTestSupport}. It validates the supported Coinbase
  * snapshot, l2update, heartbeat, and subscriptions acknowledgement paths, plus
@@ -25,7 +25,7 @@ import org.junit.jupiter.api.Test;
  * snapshot gate, and {@code InMemoryPublisher} are used.</p>
  */
 class CoinbaseL2FixtureSuiteTest {
-    private static final Path FIXTURE_DIR = Path.of("src/test/resources/fixtures/coinbase/l2");
+    private static final Path FIXTURE_DIR = Path.of("src/test/resources/venue/coinbase/l2");
 
     /**
      * Verifies the fixture directory contains the required Phase 2 Coinbase L2 coverage set.

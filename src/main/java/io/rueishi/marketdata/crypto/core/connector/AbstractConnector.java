@@ -22,7 +22,11 @@ import io.rueishi.marketdata.crypto.core.snapshot.SnapshotStrategy;
 import io.rueishi.marketdata.crypto.core.subscription.SubscriptionBuilder;
 import io.rueishi.marketdata.crypto.core.transport.WebSocketFrameHandler;
 import java.util.Objects;
-import org.agrona.concurrent.CachedNanoClock;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.TimeUnit;
 import org.agrona.concurrent.NanoClock;
 
 /**
@@ -77,8 +81,10 @@ public abstract class AbstractConnector implements Connector, WebSocketFrameHand
     private DefaultParseContext parseCtx;
     private DefaultSnapshotContext snapshotCtx;
     private DefaultRecoveryContext recoveryCtx;
+    private ExecutorService recoveryExecutor;
+    private long shutdownDeadlineMs;
     private boolean initialized;
-    private boolean recoveryInProgress;
+    private volatile boolean recoveryInProgress;
     private volatile boolean shutdownRequested;
 
     /**
@@ -126,6 +132,22 @@ public abstract class AbstractConnector implements Connector, WebSocketFrameHand
     protected abstract int headroomBytes();
 
     /**
+     * Creates the secondary trade encoder injected into the connector's {@link DefaultParseContext}.
+     *
+     * <p>The base implementation returns the same {@link SbeEncoder} instance as the primary
+     * encoder, which is correct for venues that publish only one template. Venues that publish
+     * a second template (such as {@code TRADE_EVENT} for Coinbase L3) override this hook to
+     * allocate a dedicated encoder initialized with the trade template byte. The hook is called
+     * exactly once per connector lifetime, after the primary encoder is allocated, during
+     * {@link #init(ConnectorContext)}.</p>
+     *
+     * @return encoder to use as the trade encoder in {@link DefaultParseContext}; defaults to the primary encoder
+     */
+    protected SbeEncoder createTradeEncoder() {
+        return encoder;
+    }
+
+    /**
      * Initializes connector-owned hot-path dependencies and session contexts.
      *
      * <p>The method unpacks the supplied {@link ConnectorContext} into stable
@@ -149,6 +171,8 @@ public abstract class AbstractConnector implements Connector, WebSocketFrameHand
         this.counters = gatewayCounters.forInstrument(instrument.instrumentId);
         this.eventLoopGroup = Objects.requireNonNull(ctx.eventLoopGroup(), "ctx.eventLoopGroup");
         this.clock = Objects.requireNonNull(ctx.nanoClock(), "ctx.nanoClock");
+        this.shutdownDeadlineMs = Math.max(1L, ctx.transportConfig().shutdownDeadlineMs);
+        this.recoveryExecutor = Executors.newSingleThreadExecutor(recoveryThreadFactory());
         this.encoder = new SbeEncoder(
                 instrument.instrumentId,
                 venueEnum().byteValue(),
@@ -225,7 +249,7 @@ public abstract class AbstractConnector implements Connector, WebSocketFrameHand
         if (shutdownRequested || recoveryInProgress) {
             return;
         }
-        recover(new RecoveryRequest(
+        requestRecovery(new RecoveryRequest(
                 venueEnum(),
                 instrument.instrumentId,
                 RecoveryRequestType.RESET,
@@ -279,13 +303,16 @@ public abstract class AbstractConnector implements Connector, WebSocketFrameHand
     }
 
     /**
-     * Schedules a recovery request on this connector's dedicated event-loop path.
+     * Schedules a recovery request on this connector's dedicated recovery path.
      *
-     * <p>Downstream routing can arrive from a control-plane or publisher thread,
-     * while recovery mutates connector-owned session, snapshot, and recovery
-     * state. Scheduling through the connector event loop preserves ownership.
-     * {@link #recover(RecoveryRequest)} remains the synchronous final guard for
-     * tests, venue/instrument mismatches, and duplicate in-progress coalescing.</p>
+     * <p>Downstream routing can arrive from a control-plane, publisher, parser,
+     * or transport callback thread, while recovery mutates connector-owned
+     * session, snapshot, and recovery state and may block during reconnect or
+     * handshake work. Scheduling through the connector-owned single-threaded
+     * recovery executor preserves serialized ownership without blocking the
+     * Netty event-loop callback path. {@link #recover(RecoveryRequest)} remains
+     * the synchronous final guard for tests, venue/instrument mismatches, and
+     * duplicate in-progress coalescing.</p>
      *
      * @param request recovery request metadata
      * @throws IllegalStateException if the connector has not been initialized
@@ -298,7 +325,13 @@ public abstract class AbstractConnector implements Connector, WebSocketFrameHand
         if (shutdownRequested) {
             return;
         }
-        eventLoopGroup.next().execute(() -> recover(request));
+        try {
+            recoveryExecutor.execute(() -> recover(request));
+        } catch (RejectedExecutionException ex) {
+            if (!shutdownRequested) {
+                throw ex;
+            }
+        }
     }
 
     /**
@@ -320,6 +353,7 @@ public abstract class AbstractConnector implements Connector, WebSocketFrameHand
         }
         sendUnsubscribe();
         onShutdown();
+        stopRecoveryExecutor();
         publisher.publishReset(
                 instrument.instrumentId,
                 venueEnum().byteValue(),
@@ -429,7 +463,7 @@ public abstract class AbstractConnector implements Connector, WebSocketFrameHand
      *
      * @return parse context allocated during init
      */
-    protected final DefaultParseContext parseContext() {
+    public final DefaultParseContext parseContext() {
         return parseCtx;
     }
 
@@ -438,7 +472,7 @@ public abstract class AbstractConnector implements Connector, WebSocketFrameHand
      *
      * @return active snapshot context
      */
-    protected final DefaultSnapshotContext snapshotContext() {
+    public final DefaultSnapshotContext snapshotContext() {
         return snapshotCtx;
     }
 
@@ -447,7 +481,7 @@ public abstract class AbstractConnector implements Connector, WebSocketFrameHand
      *
      * @return active recovery context
      */
-    protected final DefaultRecoveryContext recoveryContext() {
+    public final DefaultRecoveryContext recoveryContext() {
         return recoveryCtx;
     }
 
@@ -456,7 +490,7 @@ public abstract class AbstractConnector implements Connector, WebSocketFrameHand
      *
      * @return true while Phase A or Phase B recovery is active
      */
-    protected final boolean recoveryInProgress() {
+    public final boolean recoveryInProgress() {
         return recoveryInProgress;
     }
 
@@ -465,7 +499,7 @@ public abstract class AbstractConnector implements Connector, WebSocketFrameHand
      *
      * @return connector counters
      */
-    protected final InstrumentCounters counters() {
+    public final InstrumentCounters counters() {
         return counters;
     }
 
@@ -497,14 +531,15 @@ public abstract class AbstractConnector implements Connector, WebSocketFrameHand
     }
 
     /**
-     * Builds and runs a connector-scoped recovery request from parser or liveness code.
+     * Builds and submits a connector-scoped recovery request from parser or liveness code.
      *
      * <p>Venue parsers supply only action, reason, and optional diagnostic text
      * through {@link DefaultParseContext}; liveness checks call this helper
-     * directly from the connector event-loop task. The base connector fills in
-     * venue, instrument id, and request timestamp before delegating to
-     * {@link #recover(RecoveryRequest)}, whose existing duplicate coalescing
-     * remains the final guard.</p>
+     * from connector-owned monitoring tasks. The base connector fills in venue,
+     * instrument id, and request timestamp before delegating to
+     * {@link #requestRecovery(RecoveryRequest)}, whose scheduled
+     * {@link #recover(RecoveryRequest)} call still uses duplicate coalescing as
+     * the final guard.</p>
      *
      * @param type requested recovery action
      * @param reason informational recovery reason
@@ -515,7 +550,7 @@ public abstract class AbstractConnector implements Connector, WebSocketFrameHand
             RecoveryRequestType type,
             RecoveryReasonCode reason,
             String diagnosticText) {
-        recover(new RecoveryRequest(
+        requestRecovery(new RecoveryRequest(
                 venueEnum(),
                 instrument.instrumentId,
                 Objects.requireNonNull(type, "type"),
@@ -581,6 +616,7 @@ public abstract class AbstractConnector implements Connector, WebSocketFrameHand
     private void buildInitialSessionContexts() {
         this.parseCtx = new DefaultParseContext(
                 encoder,
+                createTradeEncoder(),
                 publisher,
                 counters,
                 clock,
@@ -611,6 +647,38 @@ public abstract class AbstractConnector implements Connector, WebSocketFrameHand
     private void requireInitialized() {
         if (!initialized) {
             throw new IllegalStateException("Connector must be initialized before use");
+        }
+    }
+
+    private ThreadFactory recoveryThreadFactory() {
+        return runnable -> {
+            Thread thread = new Thread(
+                    runnable,
+                    "recovery-" + venueEnum().name().toLowerCase() + "-" + instrument.instrumentId);
+            thread.setDaemon(false);
+            return thread;
+        };
+    }
+
+    private void stopRecoveryExecutor() {
+        ExecutorService currentRecoveryExecutor = recoveryExecutor;
+        if (currentRecoveryExecutor == null) {
+            return;
+        }
+        currentRecoveryExecutor.shutdown();
+        if (!awaitRecoveryExecutor(currentRecoveryExecutor, shutdownDeadlineMs)) {
+            currentRecoveryExecutor.shutdownNow();
+            awaitRecoveryExecutor(currentRecoveryExecutor, Math.min(250L, shutdownDeadlineMs));
+        }
+        recoveryExecutor = null;
+    }
+
+    private static boolean awaitRecoveryExecutor(ExecutorService executor, long timeoutMs) {
+        try {
+            return executor.awaitTermination(Math.max(1L, timeoutMs), TimeUnit.MILLISECONDS);
+        } catch (InterruptedException ex) {
+            Thread.currentThread().interrupt();
+            return false;
         }
     }
 }

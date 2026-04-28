@@ -9,7 +9,9 @@ import io.rueishi.marketdata.crypto.core.observability.MetricsEndpoint;
 import io.rueishi.marketdata.crypto.core.observability.ObservabilityRuntime;
 import io.rueishi.marketdata.crypto.core.publisher.Publisher;
 import io.rueishi.marketdata.crypto.core.recovery.RecoveryRequest;
+import io.rueishi.marketdata.crypto.core.recovery.RecoveryRequestReceiver;
 import io.rueishi.marketdata.crypto.core.recovery.RecoveryRequestRouter;
+import io.rueishi.marketdata.crypto.core.recovery.SbeRecoveryRequestReceiver;
 import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.TimeUnit;
@@ -36,6 +38,7 @@ public class GatewayRuntime implements AutoCloseable {
     private final ObservabilityRuntime observabilityRuntime;
     private final MetricsEndpoint metricsEndpoint;
     private final RecoveryRequestRouter recoveryRequestRouter;
+    private final RecoveryRequestReceiver recoveryRequestReceiver;
     private final Publisher publisher;
     private final List<Connector> connectors;
     private final List<EventLoopGroup> eventLoopGroups;
@@ -57,6 +60,7 @@ public class GatewayRuntime implements AutoCloseable {
         this.observabilityRuntime = Objects.requireNonNull(observabilityRuntime, "observabilityRuntime");
         this.metricsEndpoint = Objects.requireNonNull(metricsEndpoint, "metricsEndpoint");
         this.recoveryRequestRouter = new RecoveryRequestRouter(Objects.requireNonNull(connectors, "connectors"));
+        this.recoveryRequestReceiver = new SbeRecoveryRequestReceiver(this);
         this.publisher = Objects.requireNonNull(publisher, "publisher");
         this.connectors = List.copyOf(connectors);
         this.eventLoopGroups = List.copyOf(eventLoopGroups);
@@ -117,6 +121,21 @@ public class GatewayRuntime implements AutoCloseable {
             return false;
         }
         return recoveryRequestRouter.route(request);
+    }
+
+    /**
+     * Returns the downstream-to-gateway SBE recovery control-plane receiver.
+     *
+     * <p>Adapters that receive binary recovery control messages from downstream
+     * systems use this receiver to decode `RECOVERY_REQUEST` messages and
+     * delegate them back into {@link #requestRecovery(RecoveryRequest)}. The
+     * receiver is retained by the runtime so adapters do not need to duplicate
+     * recovery routing setup.</p>
+     *
+     * @return recovery request receiver backed by this runtime
+     */
+    public RecoveryRequestReceiver recoveryRequestReceiver() {
+        return recoveryRequestReceiver;
     }
 
     /**

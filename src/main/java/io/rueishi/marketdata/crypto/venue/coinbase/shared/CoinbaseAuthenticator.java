@@ -117,15 +117,59 @@ public final class CoinbaseAuthenticator {
      * @throws IllegalStateException if the JVM does not provide HMAC-SHA256
      */
     public String signVerifyRequest(String timestamp) {
-        String validatedTimestamp = requireText(timestamp, "timestamp");
+        return sign(requireText(timestamp, "timestamp"), VERIFY_METHOD, VERIFY_PATH);
+    }
+
+    /**
+     * Signs an arbitrary Coinbase REST prehash for a given HTTP method and path.
+     *
+     * <p>The prehash is {@code timestamp + method + path}, following the same
+     * HMAC-SHA256 and Base64 encoding used by the control-plane verify request.
+     * REST snapshot callers use this method when the path differs from the
+     * WebSocket verify path, such as
+     * {@code /products/{product_id}/book?level=3}.</p>
+     *
+     * @param timestamp Unix epoch seconds string used in the Coinbase prehash
+     * @param method HTTP method string, such as {@code "GET"}
+     * @param path request path including any query string
+     * @return Base64-encoded HMAC-SHA256 signature
+     * @throws IllegalArgumentException if any argument is blank
+     * @throws IllegalStateException if the JVM does not provide HMAC-SHA256
+     */
+    public String sign(String timestamp, String method, String path) {
+        String ts = requireText(timestamp, "timestamp");
+        String m = requireText(method, "method");
+        String p = requireText(path, "path");
         try {
             Mac mac = Mac.getInstance(HMAC_ALGORITHM);
             mac.init(new SecretKeySpec(apiSecretBytes, HMAC_ALGORITHM));
-            byte[] prehash = (validatedTimestamp + VERIFY_METHOD + VERIFY_PATH).getBytes(StandardCharsets.US_ASCII);
+            byte[] prehash = (ts + m + p).getBytes(StandardCharsets.US_ASCII);
             return Base64.getEncoder().encodeToString(mac.doFinal(prehash));
         } catch (java.security.GeneralSecurityException ex) {
             throw new IllegalStateException("Unable to sign Coinbase authentication prehash", ex);
         }
+    }
+
+    /**
+     * Builds Coinbase authentication fields for an arbitrary REST request.
+     *
+     * <p>REST venue callers use this overload when the signed path differs from
+     * the WebSocket verify path. The returned {@link AuthFields} contains the
+     * same key, passphrase, and timestamp fields as the WebSocket form, but the
+     * signature covers {@code timestamp + method + path}.</p>
+     *
+     * @param timestamp Unix epoch seconds string used in the prehash
+     * @param method HTTP method string, such as {@code "GET"}
+     * @param path request path including any query string
+     * @return key, passphrase, timestamp, and REST-signed signature values
+     * @throws IllegalArgumentException if any argument is blank
+     * @throws IllegalStateException if the JVM does not provide HMAC-SHA256
+     */
+    public AuthFields authFields(String timestamp, String method, String path) {
+        String ts = requireText(timestamp, "timestamp");
+        String m = requireText(method, "method");
+        String p = requireText(path, "path");
+        return new AuthFields(apiKey, apiPassphrase, ts, sign(ts, m, p));
     }
 
     /**
